@@ -1,0 +1,83 @@
+# ===== Python 通用 =====
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.uv/
+.python-version
+
+# ===== 桌宠运行数据 / 打包产物（不进仓库） =====
+desktop/config.json
+desktop/pet_data.db
+desktop/chat_log.jsonl
+desktop/pet_log.txt
+desktop/shots/
+desktop/assets/
+desktop/_build/
+desktop/_dist/
+*.spec
+
+# ===== AstrBot 用户数据 / 依赖 / 环境 / 日志 =====
+vendor/AstrBot/data/
+vendor/AstrBot/deps/
+vendor/AstrBot/.venv/
+vendor/AstrBot/.tmp/
+vendor/AstrBot/logs/
+vendor/AstrBot/backups/
+vendor/AstrBot/knowledge_docs/
+vendor/AstrBot/.pipcache/
+vendor/AstrBot/__pycache__/
+vendor/AstrBot/migration_tools/
+vendor/AstrBot/dashboard/node_modules/
+vendor/AstrBot/dashboard/dist/
+
+# ===== legacy-cpp 构建产物 =====
+legacy-cpp/build/
+legacy-cpp/out/
+legacy-cpp/CMakeFiles/
+legacy-cpp/x64/
+legacy-cpp/*.vcxproj.user
+*.obj
+*.o
+*.pdb
+*.ilk
+*.dll
+*.lib
+*.exe
+
+# ===== 密钥 / 私密配置 =====
+*.pem
+*.key
+.env
+.env.*
+config.json
+config.txt
+secrets/
+!**/config.example.txt
+
+# ===== 旧压缩包 / 备份（可能夹带历史数据或密钥） =====
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+backup/
+backups/
+*_old*/
+
+# ===== 系统 / IDE 垃圾 =====
+Thumbs.db
+.DS_Store
+Desktop.ini
+.vs/
+.vscode/
+.idea/
+*.suo

@@ -1,0 +1,8 @@
+# 桌宠（desktop/）运行与打包依赖（固定版本）
+# 运行：python pet.py
+# 打包：python build_exe.py（需先建 .venv 并安装本文件依赖）
+
+PySide6==6.11.2
+websockets==17.1
+httpx==0.28.1
+pyinstaller==6.22.3

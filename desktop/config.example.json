@@ -1,0 +1,9 @@
+{
+  "mode": "local",
+  "llm": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key": ""},
+  "vision": {"mode": "caption", "base_url": "", "model": "", "api_key": ""},
+  "desktop_url": "ws://127.0.0.1:6198",
+  "desktop_secret": "",
+  "chat_transport": "desktop",
+  "screen_capture": true
+}

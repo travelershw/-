@@ -1,0 +1,4 @@
+name: desktop_pet
+desc: 桌面桌宠通道：本机 WebSocket 平台适配器，桌宠里说的话算你自己的消息（记忆/好感/心情与 QQ 打通），支持附图（看屏幕），她也能主动弹到桌面
+author: migration
+version: 1.2.1

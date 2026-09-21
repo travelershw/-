@@ -1,0 +1,4 @@
+name: random_chime
+desc: 群聊随机插嘴（总闸默认关闭＝只评估不插话；打开后按群白名单插嘴，好感度高的人缩短计时）
+author: migration
+version: 1.3.0

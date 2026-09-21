@@ -1,0 +1,4 @@
+name: deepseek_search
+desc: 用 DeepSeek 原生 web_search（Responses API，模型 deepseek-v4-pro）提供 deepseek_web_search 联网检索工具
+author: migration
+version: 1.0.0

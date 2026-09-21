@@ -1,0 +1,4 @@
+name: group_knowledge
+desc: 群聊知识库：检索工具 knowledge_lookup + 群聊指令 /知识库（查询、列表、添加、补充、联网自动整理）
+author: migration
+version: 1.5.0

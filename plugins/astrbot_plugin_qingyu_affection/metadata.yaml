@@ -1,0 +1,4 @@
+name: qingyu_affection
+desc: 轻语好感度系统：按说话语气在 0~100 间微调好感度，并按好感度切换回答语气（初始 60）
+author: migration
+version: 1.0.0

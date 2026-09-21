@@ -1,0 +1,4 @@
+name: qq_parity
+desc: 迁移自研机器人时补齐的特色功能（当前时间注入、按用户冷却、短消息风格、防注入、引用清理）
+author: migration
+version: 1.1.9

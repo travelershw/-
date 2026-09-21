@@ -1,0 +1,4 @@
+name: meme_search
+desc: 按关键词联网搜表情包并发送（同一关键词会换不同的图，按内容指纹去重）；并给轻语提供 send_meme 工具，让她自己在对话里发表情包
+author: migration
+version: 1.2.0

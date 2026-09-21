@@ -1,0 +1,21 @@
+# Copy beside the executable as config.txt. Prefer environment variables for keys.
+api_key=
+model=deepseek-chat
+napcat_url=http://127.0.0.1:3000
+napcat_token=
+self_id=
+port=8080
+listen_host=127.0.0.1
+max_history=50
+cooldown_sec=8
+remember_group=1
+persist_history=1
+context_msgs=50
+context_msg_len=300
+enable_search=false
+search_api=tavily
+search_api_key=
+vision_api_key=
+vision_model=
+vision_api_url=
+keep_awake=0
