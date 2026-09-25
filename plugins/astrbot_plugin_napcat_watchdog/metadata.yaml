@@ -1,4 +1,4 @@
 name: napcat_watchdog
 desc: 连接看门狗：NapCat/QQ 掉线只提醒不自动重启（/看门狗 查｜重启｜自动重启）
 author: migration
-version: 1.1.0
+version: 1.1.1

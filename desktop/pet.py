@@ -10,9 +10,10 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 
-from PySide6.QtCore import QPoint, QRectF, Qt, QTimer
+from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -22,13 +23,16 @@ from PySide6.QtGui import (
     QPainter,
     QPixmap,
 )
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QSystemTrayIcon, QWidget
 
+import camera
 import faces
 import paths
+import pc_state
 import screen
 import sprite
 import state as state_mod
+import weather
 from bubble import Bubble
 from chat import ChatClient, ChatWindow
 from petlink import PetLinkClient
@@ -76,6 +80,59 @@ def install_crash_log() -> None:
     sys.excepthook = hook
 
 
+class NetSignals(QObject):
+    """把后台线程的网络结果送回 UI 线程。
+
+    天气/地名查询都要走网络（最坏 8 秒超时），**绝不能在 Qt 主线程里等**——
+    主线程卡住会让桌宠整个僵住（这个项目已经因为事件循环冻结吃过一次亏）。
+    用 Qt 信号从工作线程发出去，Qt 会自动排队到主线程执行。
+    """
+
+    weather = Signal(object)  # weather.Weather
+    place = Signal(object, str)  # (list[weather.Place], 错误文本), 查询用的原文
+
+
+def fetch_weather(lat: float, lon: float, place: str):  # noqa: ANN202 - weather.Weather
+    """Fetch one reading on a worker thread; no exception may escape it.
+
+    工作线程里抛异常不会有人接，线程会**静默死掉**、``_weather_busy`` 永远卡在 True
+    （以后再也点不出天气）。所以这里把任何异常都变成带 ``error`` 的结果交回主线程。
+
+    Args:
+        lat: Latitude.
+        lon: Longitude.
+        place: Display name.
+
+    Returns:
+        A ``weather.Weather`` (``error`` set when the fetch blew up).
+    """
+    try:
+        return weather.read(lat, lon, place)
+    except Exception as exc:  # noqa: BLE001 - 后台线程必须自己兜住一切
+        return weather.Weather(
+            place=place,
+            latitude=lat,
+            longitude=lon,
+            fetched_at=time.time(),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def fetch_places(query: str) -> tuple[list, str]:
+    """Look a place name up on a worker thread, same no-escape rule as above.
+
+    Args:
+        query: What the user typed.
+
+    Returns:
+        ``(candidates, error)`` — the error is empty on success.
+    """
+    try:
+        return weather.search_place(query), ""
+    except Exception as exc:  # noqa: BLE001 - 后台线程必须自己兜住一切
+        return [], f"{type(exc).__name__}: {exc}"
+
+
 DEFAULT_CONFIG = {
     # -1 表示"第一次运行时放到右下角"
     "x": -1,
@@ -92,6 +149,23 @@ DEFAULT_CONFIG = {
     "desktop_url": "ws://127.0.0.1:6198",
     "desktop_secret": "",
     "screen_capture": True,
+    # 截图格式：png（默认，无损，截图里的小字更清楚）或 jpeg（体积小得多，上传快）。
+    # 这张图要上传到模型服务商，所以在网速慢的时候切 jpeg 能明显缩短"看看屏幕"的等待。
+    "shot_format": "png",
+    # 本机使用状态采集（闲置/锁屏/前台程序/摄像头），只写本地 pc_state.json，不上传。
+    "pc_state": True,
+    # 摄像头：capture 是总开关（关掉后连菜单都不抓）；propose 只是"她可以提议看一眼"，
+    # 提议本身不抓拍——真正的抓拍永远要你点菜单。
+    "camera_capture": True,
+    "camera_propose": True,
+    # 想自己看抓到的画面时打开它：那一帧不删，留在 shots/ 里（默认用完即弃）。
+    "camera_keep_frame": False,
+    # 环境传感器（P2）：天气/空气质量/日出日落，只读网络、不用硬件。
+    # 位置必须由你给定——**不拿 IP 去猜**；没填经纬度就只提示"还没设位置"。
+    "weather": True,
+    "weather_place": "",
+    "weather_lat": 0.0,
+    "weather_lon": 0.0,
     # 独立版（分发给别人用）：local 自带大脑、填自己的 API Key；astrbot 连本机的 AstrBot
     "mode": "astrbot",
     "llm": {},
@@ -173,6 +247,25 @@ class PetWindow(QWidget):
         self._anim = QTimer(self)
         self._anim.timeout.connect(self.update)
         self._anim.start(80)
+        # 本机状态每 10 秒采一次：量小、纯本机，拿不到就记 None（见 pc_state）
+        self._pc = QTimer(self)
+        self._pc.timeout.connect(self.collect_pc_state)
+        self._pc.start(10_000)
+        self.collect_pc_state()
+        # 摄像头：只记账（时间戳/当天计数），提议由 _camera_timer 走
+        self._camera_last_capture = 0.0
+        self._camera_last_offer = 0.0
+        self._camera_offers: list[float] = []
+        self._last_talk_at = 0.0
+        self._camera_timer = QTimer(self)
+        self._camera_timer.timeout.connect(self.maybe_propose_camera)
+        self._camera_timer.start(60_000)
+        # 环境传感器（P2）：网络在后院线程跑，结果用信号回主线程
+        self._net = NetSignals()
+        self._net.weather.connect(self.on_weather)
+        self._net.place.connect(self.on_place)
+        self._weather_busy = False
+        self._geo_busy = False
         self._build_menu()
         self._build_tray()
         # 启动就连上桌面通道：她要能随时把消息弹到桌面上（不只是你打开聊天窗时）
@@ -269,6 +362,30 @@ class PetWindow(QWidget):
         act_screen = QAction("看看我的屏幕", self)
         act_screen.setToolTip("抓一张屏幕截图发给她（只在你点的时候抓）")
         act_screen.triggered.connect(lambda: self.look_at_screen())
+        act_pc = QAction("电脑状态", self)
+        act_pc.setToolTip("看本机状态采集读到了什么（闲置时间/锁屏/前台程序/摄像头）")
+        act_pc.triggered.connect(self.show_pc_state)
+        act_cam = QAction("用摄像头看一眼", self)
+        act_cam.setToolTip("只抓一帧、发完就删；只有你点这里才会拍")
+        act_cam.triggered.connect(self.look_at_camera)
+        self.act_camera_on = QAction("允许摄像头", self, checkable=True)
+        self.act_camera_on.setToolTip("关掉后她连提议都不会提，更不会拍")
+        self.act_camera_on.setChecked(bool(self.config.get("camera_capture", True)))
+        self.act_camera_on.triggered.connect(self.toggle_camera)
+        self.act_jpeg = QAction("截图用 JPEG（上传快）", self, checkable=True)
+        self.act_jpeg.setToolTip(
+            "截图要上传给模型；JPEG 通常体积更小、读图更快，代价是字迹不如 PNG 清晰"
+        )
+        self.act_jpeg.setChecked(
+            screen.normalize_format(self.config.get("shot_format")) == "jpeg"
+        )
+        self.act_jpeg.triggered.connect(self.toggle_jpeg)
+        act_weather = QAction("今天天气", self)
+        act_weather.setToolTip("查你设的那个地方的天气/空气质量/日出日落（只读网络，不用硬件）")
+        act_weather.triggered.connect(self.show_weather)
+        act_place = QAction("设置位置…", self)
+        act_place.setToolTip("填城市名（例：北京市）；我用它查经纬度存到本机，不会拿 IP 猜")
+        act_place.triggered.connect(self.set_location)
         act_setup = QAction("设置 API Key…", self)
         act_setup.triggered.connect(self.open_setup)
         act_link = QAction("重连 AstrBot", self)
@@ -277,6 +394,12 @@ class PetWindow(QWidget):
         menu.addAction(act_status)
         menu.addAction(act_recent)
         menu.addAction(act_screen)
+        menu.addAction(act_pc)
+        menu.addAction(act_cam)
+        menu.addAction(self.act_camera_on)
+        menu.addAction(self.act_jpeg)
+        menu.addAction(act_weather)
+        menu.addAction(act_place)
         menu.addAction(act_line)
         menu.addAction(act_chat)
         menu.addAction(act_link)
@@ -646,6 +769,22 @@ class PetWindow(QWidget):
             return
         self.say(client.stats(), 12000)
 
+    def collect_pc_state(self) -> None:
+        """Write one snapshot of this machine's usage state.
+
+        纯本机行为：不联网、不弹窗、不写数据库；拿不到的读数留 None。
+        采集频率由 ``self._pc`` 定时器控制（10 秒）。
+        """
+        if not self.config.get("pc_state", True):
+            return
+        pc_state.write_state()
+
+    def show_pc_state(self) -> None:
+        """Tell the user what the local state collection currently reads."""
+        state = pc_state.snapshot()
+        pc_state.write_state(state)
+        self.say(pc_state.summary(state), 9000)
+
     def look_at_screen(self, text: str = "") -> None:
         """抓一张屏幕截图发给她（只在你点的时候抓）。
 
@@ -681,10 +820,220 @@ class PetWindow(QWidget):
         QApplication.processEvents()
         time.sleep(0.2)  # 给 DWM 一点时间真的把窗口撤下去
         try:
-            return screen.capture()
+            return screen.capture(image_format=self.config.get("shot_format"))
         finally:
             for win in hidden:
                 win.show()
+
+    def toggle_jpeg(self, checked: bool) -> None:
+        """Switch the screenshot format between PNG and JPEG.
+
+        Args:
+            checked: New state from the menu item.
+        """
+        self.config["shot_format"] = "jpeg" if checked else "png"
+        save_config(self.config)
+        self.say(
+            "截图改成 JPEG 了，传得快一点，小字可能糊一点~"
+            if checked
+            else "截图换回 PNG 了，字会更清楚。",
+            6000,
+        )
+
+    def show_weather(self) -> None:
+        """Report the weather for the configured place (menu 「今天天气」）。
+
+        缓存 15 分钟内就直接用，省一次请求；过期就后台刷新，并在等待期间先把旧读数
+        摆出来**标明时间**——宁可说"这是 16:00 的读数"，也不假装它是最新的。
+        """
+        if not self.config.get("weather", True):
+            self.say("天气功能关着呢（config.json 里的 weather）~", 5000)
+            return
+        lat = float(self.config.get("weather_lat") or 0.0)
+        lon = float(self.config.get("weather_lon") or 0.0)
+        place = str(self.config.get("weather_place") or "")
+        if not lat and not lon:
+            self.say("还没设位置呢——右键点「设置位置…」，说个城市名（比如 北京市）。", 8000)
+            return
+        cached = weather.read_cache()
+        if cached is not None and weather.is_fresh(cached.fetched_at):
+            cached.stale = False
+            note(f"天气（15 分钟内的缓存）{cached.describe()}")
+            self.say(cached.describe(), 12000)
+            return
+        if self._weather_busy:
+            self.say("还在查呢，等我一下~", 4000)
+            return
+        self._weather_busy = True
+        if cached is not None:
+            cached.stale = True
+            self.say(f"先看上次的：{cached.describe()}", 9000)
+        else:
+            self.say("我查查天气…", 4000)
+        threading.Thread(
+            target=lambda: self._net.weather.emit(fetch_weather(lat, lon, place)),
+            name="pet-weather",
+            daemon=True,
+        ).start()
+
+    def on_weather(self, result) -> None:  # noqa: ANN001 - weather.Weather
+        """Show a finished reading and remember it (runs on the UI thread).
+
+        Args:
+            result: The reading delivered by the worker thread.
+        """
+        self._weather_busy = False
+        # 只有真拿到温度才覆盖缓存，免得一次断网把上次的好读数冲掉
+        if result.temperature is not None:
+            weather.write_cache(result)
+        note("天气 " + result.summary().replace("\n", "　"))
+        self.say(result.describe(), 15000)
+
+    def set_location(self) -> None:
+        """Ask for a city name and store the coordinates it resolves to (menu 「设置位置…」）。"""
+        if self._geo_busy:
+            self.say("还在查上一个地名呢~", 4000)
+            return
+        current = str(self.config.get("weather_place") or "")
+        text, ok = QInputDialog.getText(
+            self,
+            "设置位置",
+            f"城市名（现在：{current or '还没设'}）\n例：北京市 / 杭州市",
+            text=current,
+        )
+        query = str(text or "").strip()
+        if not ok or not query:
+            return
+        self._geo_busy = True
+        self.say(f"我查查「{query}」在哪…", 5000)
+        threading.Thread(
+            target=lambda: self._net.place.emit(fetch_places(query), query),
+            name="pet-geo",
+            daemon=True,
+        ).start()
+
+    def on_place(self, payload, query: str) -> None:  # noqa: ANN001 - (list, str)
+        """Store the best geocoding hit, or explain why nothing was stored.
+
+        Args:
+            payload: ``(candidates, error)`` from the worker thread.
+            query: What the user typed.
+        """
+        self._geo_busy = False
+        places, error = payload
+        if error:
+            note(f"地名查询失败「{query}」：{error}")
+            self.say(f"查「{query}」没成功：{error}", 8000)
+            return
+        if not places:
+            note(f"地名查不到「{query}」")
+            self.say(
+                f"没找到「{query}」这个城市——试着加个「市」再试，比如「{query}市」。",
+                9000,
+            )
+            return
+        best = places[0]
+        self.config["weather_place"] = best.name
+        self.config["weather_lat"] = best.latitude
+        self.config["weather_lon"] = best.longitude
+        save_config(self.config)
+        note(
+            f"位置设为 {best.describe()} {best.latitude:.4f},{best.longitude:.4f}（候选 {len(places)} 个）"
+        )
+        extra = f"（另有 {len(places) - 1} 个同名的地方）" if len(places) > 1 else ""
+        self.say(
+            f"记下了：{best.describe()}　{best.latitude:.2f},{best.longitude:.2f}{extra}",
+            10000,
+        )
+
+    def toggle_camera(self, checked: bool) -> None:
+        """Remember whether the camera feature is allowed.
+
+        Args:
+            checked: New state from the menu item.
+        """
+        self.config["camera_capture"] = bool(checked)
+        save_config(self.config)
+        self.say(
+            "摄像头开着——但只在你点「用摄像头看一眼」时才会拍~"
+            if checked
+            else "好，摄像头关了，我不会再拍。",
+            6000,
+        )
+
+    def maybe_propose_camera(self) -> None:
+        """Offer to take a look when you are around but quiet.
+
+        **This never captures anything** — it only puts a line in the bubble. The
+        camera runs only after you click the menu item (see :meth:`look_at_camera`).
+        """
+        if not self.config.get("camera_propose", True):
+            return
+        now = time.time()
+        values = pc_state.name_of(pc_state.read_state())
+        cameras = values.get("cameras")
+        offers_today = len(
+            [stamp for stamp in self._camera_offers if now - stamp < 86400],
+        )
+        if not camera.should_propose(
+            now=now,
+            enabled=bool(self.config.get("camera_capture", True)),
+            has_camera=bool(isinstance(cameras, list) and cameras),
+            idle_seconds=values.get("idle_seconds"),
+            locked=values.get("locked"),
+            last_offer_at=self._camera_last_offer,
+            offers_today=offers_today,
+            last_interaction_at=self._last_talk_at,
+        ):
+            return
+        self._camera_last_offer = now
+        self._camera_offers.append(now)
+        note("提议看一眼（只提议，等她点菜单）")
+        self.say("你在呀？想让我看一眼你吗——右键「用摄像头看一眼」我就看~", 12000)
+
+    def look_at_camera(self) -> None:
+        """Capture exactly one frame and send it (only after an explicit click).
+
+        抓之前先把桌宠/气泡/聊天窗藏起来（外接摄像头有可能拍到屏幕），抓完立刻恢复；
+        发出去之后延时删除这一帧——**用完即弃，不留在 shots 里**。
+        """
+        now = time.time()
+        has_camera = bool(camera.devices())
+        if not camera.can_capture(
+            now=now,
+            enabled=bool(self.config.get("camera_capture", True)),
+            has_camera=has_camera,
+            last_capture_at=self._camera_last_capture,
+        ):
+            self.say("摄像头关着，或者刚看过一眼——等一下再说~", 5000)
+            return
+        self._camera_last_capture = now
+        self._last_talk_at = now
+        client = self._client or self._make_client()
+        windows = [self, self.bubble, getattr(self, "_chat_window", None)]
+        hidden = [win for win in windows if win is not None and win.isVisible()]
+        for win in hidden:
+            win.hide()
+        QApplication.processEvents()
+        try:
+            frame = camera.capture()
+        finally:
+            for win in hidden:
+                win.show()
+        if frame.error:
+            self.say(frame.describe(), 6000)
+            note(frame.describe())
+            return
+        note(f"摄像头一帧　{frame.describe()}")
+        self.say(f"我看看…（{frame.width}x{frame.height}）", 4000)
+        client.send(camera.text_hint(), frame.path)
+        if self.config.get("camera_keep_frame", False):
+            self.say(f"这一帧留在 {frame.path}", 6000)
+            return
+        QTimer.singleShot(
+            camera.DELETE_AFTER_SECONDS * 1000,
+            lambda: camera.drop(frame.path),
+        )
 
     def _remember_session(self, session_id: str) -> None:
         """Store the panel session id for the log.

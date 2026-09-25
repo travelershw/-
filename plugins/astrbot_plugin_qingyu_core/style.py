@@ -57,7 +57,17 @@ REBUILD_SECONDS = 12 * 3600
 # 读出来是"空值 + 兜底值"，线上行为和测试对不上。
 # 2026-09-19 踩了两次：v1→v2（缺 answer/answer_cap，"被 @ 的答话上限"退回插嘴上限 13 字）、
 # v2→v3（缺 teacher_counts，"学习对象"被误报成"学不到东西"）。
-CARD_VERSION = 3
+# v3→v4（2026-09-23）：改成"一张总体卡片 + 每群细微差别"，老文件里没有 base。
+CARD_VERSION = 4
+# 总体卡片与每群差别的关系（2026-09-23 用户要求）：先按所有群合起来算一张总体卡片，
+# 每群再在它之下只做**细微**调整，而不是各算各的。
+#   · GROUP_WEIGHT：本群自己的测量值能拉动总体值多少（0.4 = 拉四成）；
+#   · CAP_DRIFT / ANSWER_CAP_DRIFT：再多也不能偏离总体超过这么多字（硬顶）；
+#   · POOL_MIN：本群自己的关键词/示例少于这么多条时，用总体的池子补齐。
+GROUP_WEIGHT = 0.4
+CAP_DRIFT = 6
+ANSWER_CAP_DRIFT = 12
+POOL_MIN = 12
 # 样本不够就不敢下结论：少于这么多条时退回通用约束。
 MIN_TEACHER_SAMPLES = 30
 MIN_GROUP_SAMPLES = 60
@@ -510,8 +520,125 @@ def _answer_cap(shape: dict, fallback: int) -> int:
     return max(ANSWER_CAP_MIN, min(ANSWER_CAP_MAX, cap)) if cap else fallback
 
 
+def _card_for(items: list[dict], teacher_ids: list[str], days: int) -> dict:
+    """Measure one set of messages into a card.
+
+    总体卡片和每个群的卡片都走这里，保证两者口径完全一致、可以互相比较。
+
+    Args:
+        items: Message rows belonging to this set.
+        teacher_ids: Uids treated as the learning source.
+        days: How far back the rows were read (stored on the card).
+
+    Returns:
+        The card dict, without any总体 adjustments applied yet.
+    """
+    mine = [row for row in items if row["uid"] in teacher_ids]
+    group_shape = _shape(items)
+    teacher_shape = _shape(mine) if len(mine) >= MIN_TEACHER_SAMPLES else {}
+    if teacher_shape:
+        source, source_name = mine, "学习对象"
+    elif group_shape.get("samples", 0) >= MIN_GROUP_SAMPLES:
+        source, source_name = items, "全群"
+    else:
+        source, source_name = [], "样本不足"
+    # 长度上限：学习对象的 p75 更贴你的语感；不够样本就看全群。
+    basis = teacher_shape or group_shape
+    cap = int(basis.get("p75") or 0)
+    cap = max(CAP_MIN, min(CAP_MAX, cap)) if cap else CAP_FALLBACK
+    # 被 @ 之后怎么答：先看学习对象自己的回答，再看全群。
+    answers, teacher_answers = _answers_to_questions(items, teacher_ids)
+    answer_shape = (
+        _shape(teacher_answers)
+        if len(teacher_answers) >= ANSWER_MIN_SAMPLES
+        else _shape(answers)
+    )
+    # 每个学习对象在**这个集合**里有多少条发言：加完人要能立刻看出"学不学得到东西"。
+    counts = {uid: sum(1 for row in items if row["uid"] == uid) for uid in teacher_ids}
+    return {
+        "built_at": int(time.time()),
+        "window_days": days,
+        "cap": cap,
+        "cap_basis": source_name,
+        "group": group_shape,
+        "teacher": teacher_shape,
+        "teacher_counts": counts,
+        "keywords": _keywords(source),
+        "exemplars": _exemplars(source),
+        "answer": answer_shape,
+        "answer_cap": _answer_cap(answer_shape, cap),
+        "answer_examples": _exemplars(teacher_answers or answers)[
+            :ANSWER_EXEMPLAR_LIMIT
+        ],
+    }
+
+
+def _drift_towards(base_value: int, own_value: int, drift: int) -> int:
+    """Pull one length cap from the overall value towards the group's own value.
+
+    Args:
+        base_value: The value measured across all groups.
+        own_value: The value measured in this group alone.
+        drift: Hard limit on how far the result may differ from ``base_value``.
+
+    Returns:
+        The blended cap, never further than ``drift`` from the overall value.
+    """
+    if not base_value:
+        return own_value
+    pulled = base_value + round((own_value - base_value) * GROUP_WEIGHT)
+    return max(1, max(base_value - drift, min(base_value + drift, pulled)))
+
+
+def _fit_to_base(own: dict, base: dict) -> dict:
+    """Keep a group card close to the overall card, adding only subtle differences.
+
+    Args:
+        own: The card measured from this group alone.
+        base: The card measured across all groups.
+
+    Returns:
+        The group card with blended caps, base fallbacks for thin samples, and
+        the original measurements kept alongside for `/风格` to display.
+    """
+    card = dict(own)
+    # 本群样本不够时，长度直接用总体值（样本不足时本群测出来的数字是噪声，不该拿它去偏离），
+    # 语气参照也换成总体；但**本群自己的统计数字一并保留**，`/风格` 里要显示真实的样本条数，
+    # 不能把总体的 2090 条算到这个群头上（2026-09-23 自己发现并修掉）。
+    thin = own["cap_basis"] == "样本不足"
+    if thin:
+        card["cap"] = int(base.get("cap") or own["cap"])
+        card["answer_cap"] = int(base.get("answer_cap") or own["answer_cap"])
+        card["cap_basis"] = "总体"
+        card["borrowed"] = True
+        card["basis"] = dict(base.get("teacher") or base.get("group") or {})
+    else:
+        card["cap"] = _drift_towards(
+            int(base.get("cap") or 0),
+            int(own["cap"]),
+            CAP_DRIFT,
+        )
+        card["answer_cap"] = _drift_towards(
+            int(base.get("answer_cap") or 0),
+            int(own["answer_cap"]),
+            ANSWER_CAP_DRIFT,
+        )
+        card["basis"] = dict(own.get("teacher") or own.get("group") or {})
+    card["cap_own"] = int(own["cap"])
+    card["answer_cap_own"] = int(own["answer_cap"])
+    for key in ("keywords", "exemplars", "answer_examples"):
+        pool = list(own.get(key) or [])
+        if len(pool) < POOL_MIN:
+            extra = [
+                item for item in (base.get(key) or []) if item not in pool
+            ]
+            card[key] = pool + extra
+            card["borrowed"] = True
+    return card
+
+
 def build_cards(days: int = WINDOW_DAYS, teachers: list[str] | None = None) -> dict:
-    """Rebuild every group's style card from the history database.
+    """Rebuild the overall style card and every group's card beneath it.
 
     统计分两套：**学习对象**（白名单里那些人）与**全群真人**。措辞约束优先用学习对象的，
     因为你要的是"像你们群里的人"，而白名单初期就是你本人。
@@ -519,12 +646,15 @@ def build_cards(days: int = WINDOW_DAYS, teachers: list[str] | None = None) -> d
     2026-09-19 补：被 @ 之后"怎么答"是另一套形状（群里人回答的中位 19 字、没人用「嗯~」开场），
     所以卡片里单独存一份 **answer**（问句之后 60 秒内别人的第一条）与它的长度上限。
 
+    2026-09-23 改：先按所有群合起来算一张**总体卡片**（``state["base"]``），每个群再在它之下
+    只做细微调整（见 :func:`_fit_to_base`）——她要先是"同一个人"，然后才是"在哪个群"。
+
     Args:
         days: How far back to read.
         teachers: Uids to learn from (defaults to :data:`DEFAULT_TEACHERS`).
 
     Returns:
-        The new state dict (``teachers`` + ``cards`` + ``built_at``).
+        The new state dict (``teachers`` + ``base`` + ``cards`` + ``built_at``).
     """
     teacher_ids = [str(item) for item in (teachers or DEFAULT_TEACHERS)]
     rows = _read_history(days=days)
@@ -532,60 +662,25 @@ def build_cards(days: int = WINDOW_DAYS, teachers: list[str] | None = None) -> d
     for row in rows:
         groups.setdefault(row["group"], []).append(row)
 
-    cards: dict[str, dict] = {}
-    for group, items in groups.items():
-        mine = [row for row in items if row["uid"] in teacher_ids]
-        group_shape = _shape(items)
-        teacher_shape = _shape(mine) if len(mine) >= MIN_TEACHER_SAMPLES else {}
-        if teacher_shape:
-            source, source_name = mine, "学习对象"
-        elif group_shape.get("samples", 0) >= MIN_GROUP_SAMPLES:
-            source, source_name = items, "全群"
-        else:
-            source, source_name = [], "样本不足"
-        # 长度上限：学习对象的 p75 更贴你的语感；不够样本就看全群。
-        basis = teacher_shape or group_shape
-        cap = int(basis.get("p75") or 0)
-        cap = max(CAP_MIN, min(CAP_MAX, cap)) if cap else CAP_FALLBACK
-        # 被 @ 之后怎么答：先看学习对象自己的回答，再看全群。
-        answers, teacher_answers = _answers_to_questions(items, teacher_ids)
-        answer_shape = (
-            _shape(teacher_answers)
-            if len(teacher_answers) >= ANSWER_MIN_SAMPLES
-            else _shape(answers)
-        )
-        # 每个学习对象在**这个群**里有多少条发言：加完人要能立刻看出"学不学得到东西"。
-        counts = {
-            uid: sum(1 for row in items if row["uid"] == uid) for uid in teacher_ids
-        }
-        cards[group] = {
-            "built_at": int(time.time()),
-            "window_days": days,
-            "cap": cap,
-            "cap_basis": source_name,
-            "group": group_shape,
-            "teacher": teacher_shape,
-            "teacher_counts": counts,
-            "keywords": _keywords(source),
-            "exemplars": _exemplars(source),
-            "answer": answer_shape,
-            "answer_cap": _answer_cap(answer_shape, cap),
-            "answer_examples": _exemplars(teacher_answers or answers)[
-                :ANSWER_EXEMPLAR_LIMIT
-            ],
-        }
+    base = _card_for(rows, teacher_ids, days)
+    cards: dict[str, dict] = {
+        group: _fit_to_base(_card_for(items, teacher_ids, days), base)
+        for group, items in groups.items()
+    }
     described = "、".join(
         "{}: 插嘴 {}字/答 {}字".format(group, item.get("cap"), item.get("answer_cap"))
         for group, item in cards.items()
     )
     logger.info(
-        f"qingyu_core: 群味卡片重建完成——{len(cards)} 个群（{described or '无样本'}）",
+        f"qingyu_core: 群味卡片重建完成——总体 插嘴 {base.get('cap')}字/答 "
+        f"{base.get('answer_cap')}字，{len(cards)} 个群（{described or '无样本'}）",
     )
     return {
         "version": CARD_VERSION,
         "teachers": teacher_ids,
         "built_at": int(time.time()),
         "window_days": days,
+        "base": base,
         "cards": cards,
     }
 
@@ -700,15 +795,16 @@ def ensure_cards(force: bool = False) -> dict:
 
 
 def card(group_id: str) -> dict:
-    """Return one group's card (empty dict when unknown).
+    """Return one group's card, falling back to the overall card.
 
     Args:
         group_id: Platform group id.
 
     Returns:
-        The card dict.
+        The card dict (the总体 card for a group with no samples yet, else ``{}``).
     """
-    return load_state()["cards"].get(str(group_id)) or {}
+    state = load_state()
+    return state["cards"].get(str(group_id)) or state.get("base") or {}
 
 
 def pick_answer_examples(
@@ -895,7 +991,8 @@ def hint(group_id: str, context: str = "") -> str | None:
     data = card(group_id)
     if not data:
         return None
-    basis = data.get("teacher") or data.get("group") or {}
+    # basis：本群自己的形状；样本不足时是总体的形状（见 _fit_to_base）。
+    basis = data.get("basis") or data.get("teacher") or data.get("group") or {}
     if not basis:
         return None
     cap = int(data.get("cap") or CAP_FALLBACK)
@@ -949,6 +1046,15 @@ def summary(group_id: str = "") -> str:
     else:
         lines.append("卡片还没建过（发「/风格 重建」立刻建一次）")
     cards = state["cards"]
+    base = state.get("base") or {}
+    if base:
+        lines.append(
+            f"总体（所有群合起来）：样本 {base.get('group', {}).get('samples', 0)} 条"
+            f"（学习对象 {base.get('teacher', {}).get('samples', 0)} 条）｜"
+            f"中位 {(base.get('teacher') or base.get('group') or {}).get('p50')} 字｜"
+            f"插嘴上限 {base.get('cap')} 字（按{base.get('cap_basis')}）｜"
+            f"答话上限 {base.get('answer_cap')} 字",
+        )
     if not cards:
         lines.append("没有任何群的样本。")
         return "\n".join(lines)
@@ -958,16 +1064,19 @@ def summary(group_id: str = "") -> str:
         if group_id and group != str(group_id):
             continue
         basis = data.get("teacher") or data.get("group") or {}
+        drift = ""
+        if base:
+            drift = f"（总体 {base.get('cap')}→{data.get('cap')}）"
         lines.append(
             f"· 群 {group}：样本 {data.get('group', {}).get('samples', 0)} 条"
             f"（学习对象 {data.get('teacher', {}).get('samples', 0)} 条）｜"
             f"中位 {basis.get('p50')} 字 / p75 {basis.get('p75')} 字｜"
-            f"插嘴上限 {data.get('cap')} 字（按{data.get('cap_basis')}）｜"
+            f"插嘴上限 {data.get('cap')} 字{drift}（按{data.get('cap_basis')}）｜"
             f"答话上限 {data.get('answer_cap')} 字（{data.get('answer', {}).get('samples', 0)} 条回答样本）｜"
             f"波浪号 {round(float(basis.get('tilde_share') or 0) * 100)}%｜"
             f"示例 {len(data.get('exemplars') or [])} 条"
-            + ("　← 当前群" if str(group_id) == group else ""),
-        )
+            + ("　（借了总体样本）" if data.get("borrowed") else "")
+            + ("　← 当前群" if str(group_id) == group else ""),        )
     return "\n".join(lines)
 
 

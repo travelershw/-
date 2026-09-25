@@ -42,11 +42,34 @@ python build_exe.py
 
 `build_exe.py` 内部会用 `.venv` 里的 Python 调 PyInstaller，产物输出到 `_dist/`（单目录 + zip）。
 
+> **已知限制（诚实说明）**：`build_exe.py` 的 `EXCLUDES` 目前把 `PySide6.QtMultimedia` 排除了，
+> 所以**打包出来的 exe 用不了摄像头**（源码运行不受影响）。要 exe 也带摄像头，
+> 需要把该项从 `EXCLUDES` 里删掉再打包（体积会变大）。
+
 ### 4. 桌宠说明
 
 - **可独立运行**：不连 AstrBot 也能用。选“独立模式”后，**API Key 由用户自己在设置窗口里配置**，只写入本机 `config.json`，不上传。
 - **无立绘，程序 fallback 绘制**：源码不带角色立绘资源，程序用内置的 fallback 绘制一个简易形象；想换图可自行把 png/jpg/webp 放进 `assets/`，右键桌宠 →「重新读取立绘」。
 - **连 AstrBot（可选）**：桌宠通过本机 `ws://127.0.0.1:6198` 连接 AstrBot 的 `desktop_pet` 适配器，使记忆/好感/心情与 QQ 打通。
+
+### 5. 桌宠的传感器（右键菜单）
+
+| 菜单项 | 作用 | 说明 |
+| --- | --- | --- |
+| 看屏幕 | 抓一张屏幕截图发给她 | **只在你点击时抓**；抓前自动隐藏桌宠/气泡，免得"看到自己" |
+| 截图用 JPEG（上传快） | 截图格式开关 | 默认 PNG（小字清楚）；JPEG 体积更小、上传更快但字略糊。这张图是要**上传到模型服务商**的，上行体积直接决定等待时间 |
+| 电脑状态 | 看本机状态读数 | 闲置时长 / 是否锁屏 / 前台程序**进程名**（不含窗口标题）/ 摄像头列表；只写本机 `pc_state.json`，不上传 |
+| 用摄像头看一眼 | 抓一帧 | **只有点这里才会拍**；一次一帧，发送后 60 秒删除；她最多"提议看一眼"，**提议本身不抓拍** |
+| 允许摄像头 | 总开关 | 关掉后连提议都不会提 |
+| 今天天气 | 天气 / 空气质量 / 日出日落 | 走 [Open-Meteo](https://open-meteo.com/)（**免 API Key、免注册**），只读 GET |
+| 设置位置… | 填城市名 | 用它查一次经纬度，**存到本机 `config.json`**（`weather_place` / `weather_lat` / `weather_lon`）。**不会用 IP 反查你的位置**；不填就没法查天气（只会提示你去设） |
+
+> **中文城市名的小坑（实测）**：直接在「设置位置…」里填「开封」这类名字，地图服务
+> 可能先返回**同名的小村庄**（人口为空，甚至不在同一个省）。桌宠只认"有真实人口"的结果，
+> 找不到就让你换个说法，**不会把你定位到别的省**；遇到查不到时加个「市」再试（例如「开封市」）
+> 基本都能命中——抽样 28 个城市里有 11 个都是这样（吉林、宜昌、桂林、佛山、东莞……），
+> 而「杭州」「苏州」「成都」这类不带「市」也能命中。
+> 无论如何，落地的都是**你自己填的城市**，请核对气泡里报出的"省 + 城市"。
 
 ### 5. 桌宠关键配置
 
@@ -55,6 +78,13 @@ python build_exe.py
 | API Key | 独立模式下由用户在设置窗口填写，存于本机 `config.json` |
 | `QINGYU_USER_ID` | 桌宠连 AstrBot 时的身份 ID，**必须与 `desktop_pet` 适配器配置的 `user_id` 一致**（默认用你的 QQ 号），否则记忆/好感不会落到同一个人身上 |
 | `QINGYU_KNOWLEDGE_DIR` | 可覆盖知识库目录（默认取 AstrBot 数据目录下的知识库路径） |
+| `screen_capture` / `camera_capture` / `pc_state` / `weather` | 四个传感器总开关（默认都开）。关掉即彻底停用对应读写 |
+| `shot_format` | 截图格式：`png`（默认）或 `jpeg`；也可用右键菜单切换 |
+| `camera_keep_frame` | 默认 `false`＝摄像头那一帧发送后删除；改成 `true` 会留在 `shots/` 里 |
+| `weather_place` / `weather_lat` / `weather_lon` | 天气的位置。**默认是空的**，用右键菜单「设置位置…」填一次即可 |
+
+> ⚠️ **改 `config.json` 前先退出桌宠**：桌宠在正常退出时会用内存里的设置**整体重写**
+> `config.json`，边跑边改会被覆盖掉。
 
 ---
 
@@ -80,7 +110,12 @@ python build_exe.py
 ### 4. 看门狗插件（napcat_watchdog）
 
 - 运行逻辑**内置**在插件目录内的 `watchdog_runtime.py`，不依赖 `vendor/AstrBot/migration_tools`（该目录已从 vendor 中排除）。
-- **默认 notify-only**：掉线只提醒（Windows 弹窗 + 日志 + 桌宠提示），**不自动重启 QQ**。
+- **默认 notify-only**：掉线只提醒（Windows 弹窗 + 日志 + 桌宠提示），**不自动重启 QQ**
+  （公开版把 `AUTO_RESTART` 置为 `False`；作者本机是自己开着的，这个是发布默认值）。
+  需要自动恢复时用 `/看门狗 自动重启 开` 自行打开，并注意下面的风险与节流参数。
+- **节流参数**（`watchdog_runtime.py` 顶部）：`RESTART_COOLDOWN_MINUTES = 60`、
+  `MAX_RESTARTS_PER_HOUR = 1`、`ALLOW_KILL_ALL_QQ = False`（只结束"正托管着 NapCat 的那个 PID"，
+  不做"杀掉所有 QQ 进程"这种事）。
 - **手动重启 QQ 有风险**：自动/手动重启会结束当前 QQ 再拉起，可能打断你正在进行的会话，请谨慎使用。
 - **仅 Windows**：依赖 NapCat 注入 QQNT 的方式（`napimain.exe` / `napiloader.dll` 等）。
 - 需配置环境变量：

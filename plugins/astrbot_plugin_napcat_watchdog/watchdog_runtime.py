@@ -5,10 +5,13 @@
 NapCat 的反连：
 
 1. **判定离线**：连续 ``FAILS_TO_ACT`` 次（默认 2 次 ≈ 4 分钟）没有连接才算掉线，避免误报；
-2. **只提醒，不动你的 QQ**（``AUTO_RESTART = False``，2026-09-18 起）：
-   Windows 弹窗 + 写日志 + 给桌面桌宠留一条提醒（QQ 断了她只能在桌面上说话）；
-3. **要重启由你决定**：发 ``/看门狗 重启``（插件里），或手动把 ``AUTO_RESTART`` 改成 True
-   恢复原来的自动抢救（结束 QQ → 用加载器拉起，一般不用重新扫码）。
+2. **自动重启（2026-09-24 起，``AUTO_RESTART = False``）**：判定掉线后先试着用加载器把
+   NapCat 拉起来；还不行就**只结束"承载 NapCat 的那个 QQ"**（按 NapCat 的 HTTP 端口反查 PID），
+   再拉起加载器——**绝不 ``taskkill /IM QQ.exe``**，不会误杀你自己在用的 QQ。
+   带安全阀：``RESTART_COOLDOWN_MINUTES`` 内不重复、``MAX_RESTARTS_PER_HOUR`` 封顶。
+   2026-09-24 当天出现 3 次"登录已失效被踢"，人工重启太频繁，所以改成自动。
+3. **提醒照旧**：Windows 弹窗 + 写日志 + 给桌面桌宠留一条提醒；
+   手动路径仍是 ``/看门狗 重启``。
 
 Usage:
     python napcat_watchdog.py             # 正常跑一次（插件/计划任务用这个）
@@ -42,6 +45,17 @@ POPUP_TIMEOUT_SECONDS = 60
 #   · 群里/面板发 ``/看门狗 重启``（手动）
 #   · 或把这里改成 True（保留原逻辑，想恢复自动抢救再打开）
 AUTO_RESTART = False
+# NapCat 的 HTTP 服务就监听在"承载它的那个 QQ 进程"里，所以用它反查 PID——
+# 这样自动重启可以只结束那一个进程，永远不用 `taskkill /IM QQ.exe`（那会连你自己在用的 QQ 一起杀）。
+NAPCAT_HTTP_PORT = 3000
+# 兜底开关：确认不出 PID 时要不要退回"结束所有 QQ"。默认关——宁可只提醒，也不误杀。
+ALLOW_KILL_ALL_QQ = False
+# 自动重启的安全阀，避免反复折腾。2026-09-24 从 20 分钟/每小时 4 次放宽到 60 分钟/每小时 1 次：
+# 社区普遍报告"被踢"是腾讯服务端对注入式客户端的风控
+# （NapCatQQ Issue #1728 标题即"最新版本的 NapCat/QQ 登录会被风控检测导致频繁掉线"），
+# 而每次"结束 QQ + 重新注入"都是一次新的登录动作——重启越勤，越可能加重风控。
+RESTART_COOLDOWN_MINUTES = 60
+MAX_RESTARTS_PER_HOUR = 1
 # 桌面桌宠会读这个文件，把提醒冒泡到桌面上（QQ 断了的时候，桌面是她唯一还能说话的地方）
 ALERT_FILE = Path.home() / ".astrbot" / "logs" / "napcat_alert.json"
 
@@ -66,12 +80,14 @@ def load_state() -> dict:
     """Read the persisted counters.
 
     Returns:
-        The state dict (empty when missing or broken).
+        The state dict (empty when missing, broken, or not an object).
     """
     try:
-        return json.loads(STATE.read_text(encoding="utf-8"))
+        data = json.loads(STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    # A file holding ``null``/a list must not reach callers expecting a dict.
+    return data if isinstance(data, dict) else {}
 
 
 def save_state(state: dict) -> None:
@@ -170,11 +186,14 @@ def process_running(name: str) -> bool | None:
         import psutil  # noqa: PLC0415 - 可选依赖，按需导入
     except ImportError:
         psutil = None
+    wanted = str(name or "").lower()
+    if not wanted:
+        return None
     if psutil is not None:
         try:
             for proc in psutil.process_iter(["name"]):
                 proc_name = proc.info.get("name") or ""
-                if proc_name.lower() == name.lower():
+                if proc_name.lower() == wanted:
                     return True
             return False
         except Exception:  # noqa: BLE001 - 退回 tasklist
@@ -193,7 +212,99 @@ def process_running(name: str) -> bool | None:
     output = completed.stdout
     if not output:
         return None
-    return name.lower() in output.lower()
+    return wanted in str(output).lower()
+
+
+def napcat_host_pid() -> int | None:
+    """Which process is hosting NapCat right now.
+
+    NapCat 注入在 QQ 进程里，并把自己的一体化 HTTP 服务挂在 ``NAPCAT_HTTP_PORT`` 上，
+    所以"监听那个端口的人"就是承载 NapCat 的 QQ——这是唯一能可靠区分
+    "机器人那个 QQ" 和 "你自己在用的 QQ" 的办法（两者的命令行长得一模一样）。
+
+    Returns:
+        承载进程的 PID；确认不出来时返回 None。
+    """
+    try:
+        import psutil  # noqa: PLC0415 - 可选依赖，按需导入
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                if (
+                    conn.status == "LISTEN"
+                    and conn.laddr
+                    and getattr(conn.laddr, "port", None) == NAPCAT_HTTP_PORT
+                    and conn.pid
+                ):
+                    return int(conn.pid)
+        except Exception:  # noqa: BLE001 - 退回 netstat
+            pass
+    needle = f":{NAPCAT_HTTP_PORT}"
+    for line in netstat_lines():
+        parts = line.split()
+        if len(parts) < 5 or needle not in parts[1] or parts[3] != "LISTENING":
+            continue
+        try:
+            return int(parts[4])
+        except ValueError:
+            continue
+    return None
+
+
+def process_image(pid: int) -> str:
+    """Image name of one process, for a sanity check before killing it.
+
+    Args:
+        pid: Process id.
+
+    Returns:
+        The image name, or an empty string when it cannot be read.
+    """
+    try:
+        import psutil  # noqa: PLC0415 - 可选依赖，按需导入
+    except ImportError:
+        return ""
+    try:
+        return str(psutil.Process(pid).name() or "")
+    except Exception:  # noqa: BLE001 - 读不到就当不知道
+        return ""
+
+
+def stop_napcat_host() -> str:
+    """End only the QQ process that hosts NapCat.
+
+    绝不 ``taskkill /IM QQ.exe``：那会连用户自己在用的 QQ 一起杀掉（2026-09-18 就是因为
+    这个才关掉自动重启的）。确认不出承载进程时什么都不做，只报告。
+
+    Returns:
+        A short result summary.
+    """
+    pid = napcat_host_pid()
+    if pid is None:
+        if ALLOW_KILL_ALL_QQ:
+            log("确认不出承载进程，按设置退回结束所有 QQ")
+            kill_qq()
+            return "已结束所有 QQ（兜底设置）"
+        return f"没找到监听 {NAPCAT_HTTP_PORT} 的进程，不结束任何 QQ（只提醒）"
+    image = process_image(pid)
+    if image and image.lower() != "qq.exe":
+        return f"{NAPCAT_HTTP_PORT} 端口属于 {image}（pid {pid}），不是 QQ，不结束"
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        time.sleep(5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"结束承载 NapCat 的 QQ 失败: {exc}")
+        return f"结束 pid {pid} 失败"
+    log(f"已结束承载 NapCat 的 QQ（pid {pid}，{image or 'QQ.exe'}）")
+    return f"已结束承载 NapCat 的 QQ（pid {pid}）"
 
 
 def kill_qq() -> None:
@@ -282,19 +393,50 @@ def publish_alert(text: str) -> None:
         log(f"写提醒文件失败: {exc}")
 
 
-def restart_now() -> str:
+def restart_now(auto: bool = False) -> str:
     """Try to bring NapCat back right now (manual path, and AUTO_RESTART uses it too).
+
+    自动路径要保守：**只在能确认"哪个进程在承载 NapCat"时才动手**。
+    确认不出来（例如 QQ 被重启过、NapCat 根本没加载）时，直接注入加载器有可能把 NapCat
+    装到用户自己在用的那个 QQ 上——那比"多掉一会儿线"严重得多，所以自动路径只提醒。
+    手动路径（``/看门狗 重启``）由用户发起，保持原来的宽松行为。
+
+    Args:
+        auto: True 表示这是看门狗自己发起的，遇到不确定的情况就不动手。
 
     Returns:
         A short result summary.
     """
     state = load_state()
+    hour_ago = time.time() - 3600
+    recent = [float(item) for item in (state.get("restarts") or []) if float(item) > hour_ago]
+    if len(recent) >= MAX_RESTARTS_PER_HOUR:
+        return f"一小时里已经重启 {len(recent)} 次，先停手（避免反复折腾 QQ）"
+    last = float(state.get("last_restart") or 0)
+    if last and time.time() - last < RESTART_COOLDOWN_MINUTES * 60:
+        left = int(RESTART_COOLDOWN_MINUTES * 60 - (time.time() - last))
+        return f"距上次重启还不到 {RESTART_COOLDOWN_MINUTES} 分钟（还有 {left} 秒），先不重启"
+    state["restarts"] = [*recent, time.time()]
+    state["last_restart"] = time.time()
+    save_state(state)
+
     qq_up = process_running("QQ.exe")
+    host = napcat_host_pid()
+    if auto:
+        if qq_up is not False and host is None:
+            log(
+                "自动重启暂缓：QQ 在跑，但找不到承载 NapCat 的进程"
+                f"（{NAPCAT_HTTP_PORT} 端口没人监听），怕注错实例——交给你手动拉起",
+            )
+            return "需要手动处理（无法确认承载实例，未动 QQ）"
+        if qq_up is False:
+            log("QQ 没在跑，直接用加载器拉起")
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        # 第二次尝试前，只要 QQ 还开着（或状态未知）就先结束它——否则加载器注入不进去。
         if attempt == 2 and qq_up is not False:
-            log("QQ 还在跑但 NapCat 没起来，结束 QQ 后用加载器重启")
-            kill_qq()
+            # 第二次尝试前先收掉承载 NapCat 的那个 QQ——加载器才注入得进去。
+            log("QQ 还在跑但 NapCat 没起来，只结束承载 NapCat 的那个 QQ 再重启")
+            log(f"结束结果：{stop_napcat_host()}")
         if not start_napcat():
             break
         time.sleep(START_WAIT_SECONDS)
@@ -350,6 +492,7 @@ def check_once(dry_run: bool = False) -> str:
             log(f"已恢复：6199 上有 {len(peers)} 条连接")
         state["fails"] = 0
         state["attempts"] = 0
+        state.pop("cooling_logged", None)
         save_state(state)
         return "在线"
 
@@ -361,7 +504,12 @@ def check_once(dry_run: bool = False) -> str:
         return f"第 {fails}/{FAILS_TO_ACT} 次确认中"
 
     if time.time() - float(state.get("last_alert", 0)) < ALERT_COOLDOWN_MINUTES * 60:
-        log("仍在冷却期，跳过本次处理")
+        # 这个分支每 2 分钟就会走一次；每次都写日志会把真正的错误淹掉
+        # （2026-09-22 实测一天近 700 行）。改成一次冷却期只提示一次。
+        if not state.get("cooling_logged"):
+            state["cooling_logged"] = 1
+            save_state(state)
+            log(f"仍在冷却期（{ALERT_COOLDOWN_MINUTES} 分钟内只提示一次）")
         return "冷却中（上次抢救失败）"
 
     log(
@@ -376,6 +524,7 @@ def check_once(dry_run: bool = False) -> str:
         # 只提醒：**先把持久的提醒落下来**（日志 + 给桌宠的文件），再弹窗。
         # 弹窗可能被用户晾着，不能让它挡住这两件事（吃过一次亏）。
         state["last_alert"] = time.time()
+        state["cooling_logged"] = 0
         save_state(state)
         hint = (
             f"NapCat 连续 {FAILS_TO_ACT} 次没连上（6199 无连接，QQ={qq_label}）。\n"
@@ -393,6 +542,7 @@ def check_once(dry_run: bool = False) -> str:
         return f"已自动恢复（{result}）"
 
     state["last_alert"] = time.time()
+    state["cooling_logged"] = 0
     save_state(state)
     log("自动重启没救回来，提醒用户（可能需要手动扫码登录）")
     hint = (

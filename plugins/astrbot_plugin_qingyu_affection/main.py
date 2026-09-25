@@ -16,6 +16,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core import logger
+from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 INITIAL_AFFECTION = 60
@@ -63,18 +64,25 @@ class QingyuAffectionPlugin(Star):
         score = self._score(sender)
         _, band, directive = self._band(score)
         who = event.get_sender_name() or sender
-        req.system_prompt = (req.system_prompt or "") + (
-            f"\n[好感度系统] 你和当前说话的人「{who}」的好感度是 {score}/100（{band}）。"
-            f"本次回复的语气要求：{directive}。"
-            "每轮对话都要判断对方这句话的语气，但**加分的门槛要高**："
-            "只有对方明确夸你、真诚道谢、实打实关心你、或者聊得特别投机时才加 1~2 分；"
-            "只是礼貌寒暄、随口接话、发个表情，不算，不要调用工具。"
-            "反过来，只有对方明显粗鲁、嘲讽、骂你、冒犯、命令你或无理取闹时才减 1~2 分；"
-            "稍微冷淡或语气平淡都不算。"
-            "也就是说：绝大多数普通对话都不应该调用这个工具，"
-            "只有态度确实明显时才调用，且每次最多 2 分。"
-            "文字回复和工具调用可以同时进行，语气要自然地融进轻语的人设，"
-            "不要说出好感度数字，也不要提到这个系统本身。"
+        # The affection level and its tone directive change every turn, so they go
+        # to the tail of the user content; keeping the system prompt byte-identical
+        # lets the provider reuse its prefix cache for the conversation history.
+        req.extra_user_content_parts.append(
+            TextPart(
+                text=(
+                    f"\n[好感度系统] 你和当前说话的人「{who}」的好感度是 {score}/100（{band}）。"
+                    f"本次回复的语气要求：{directive}。"
+                    "每轮对话都要判断对方这句话的语气，但**加分的门槛要高**："
+                    "只有对方明确夸你、真诚道谢、实打实关心你、或者聊得特别投机时才加 1~2 分；"
+                    "只是礼貌寒暄、随口接话、发个表情，不算，不要调用工具。"
+                    "反过来，只有对方明显粗鲁、嘲讽、骂你、冒犯、命令你或无理取闹时才减 1~2 分；"
+                    "稍微冷淡或语气平淡都不算。"
+                    "也就是说：绝大多数普通对话都不应该调用这个工具，"
+                    "只有态度确实明显时才调用，且每次最多 2 分。"
+                    "文字回复和工具调用可以同时进行，语气要自然地融进轻语的人设，"
+                    "不要说出好感度数字，也不要提到这个系统本身。"
+                ),
+            ),
         )
 
         # AstrBot drops every tool when the provider config lists modalities

@@ -23,6 +23,9 @@ desktop/shots/
 desktop/assets/
 desktop/_build/
 desktop/_dist/
+# 传感器运行数据：本机状态读数与天气缓存（含你填的位置），只在本机，绝不进仓库
+desktop/pc_state.json
+desktop/weather.json
 *.spec
 
 # ===== AstrBot 用户数据 / 依赖 / 环境 / 日志 =====

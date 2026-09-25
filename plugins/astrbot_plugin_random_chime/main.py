@@ -30,7 +30,7 @@ STATE_STORE = Path(get_astrbot_plugin_data_path()) / "random_chime_state.json"
 
 # 白名单初始值：只在状态文件里还没有 enabled_sessions 时用它做种子。
 # 留空 = 一个群都不插嘴。平时用 /插嘴开、/插嘴关 管理，改这里要重载插件。
-# 会话说到底就是 unified_msg_origin，形如 "napcat:GroupMessage:10003"。
+# 会话说到底就是 unified_msg_origin，形如 "napcat:GroupMessage:10004"。
 CHIME_WHITELIST: tuple[str, ...] = ()
 # 总闸：2026-09-17 起打开，进入"真的会插话"的测试阶段。
 # 白名单为空时即使总闸开着也不会插。

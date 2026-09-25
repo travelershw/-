@@ -1,4 +1,4 @@
 name: qingyu_core
 desc: 轻语 Agent 核心：群味管长度、好感度管语气、引用/叫名字/她刚说完的接力都算在叫她 + 记忆 + 周报
 author: migration
-version: 0.17.1
+version: 0.19.0

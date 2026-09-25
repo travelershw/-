@@ -20,6 +20,7 @@ r"""连接看门狗：NapCat/QQ 掉线就**提醒你**（不再自动重启 QQ�
 import asyncio
 import importlib.util
 import time
+import traceback
 from pathlib import Path
 
 from astrbot.api.event import AstrMessageEvent, filter
@@ -28,6 +29,8 @@ from astrbot.core import logger
 
 SCRIPT = Path(__file__).with_name("watchdog_runtime.py")
 CHECK_SECONDS = 120
+# 同一个结果最多这么久重复提醒一次：冷却期每 2 分钟一条会把真错误淹掉。
+LOG_REPEAT_SECONDS = 1800
 
 
 def _load_watchdog():
@@ -53,7 +56,7 @@ def _load_watchdog():
     "napcat_watchdog",
     "migration",
     "连接看门狗：NapCat/QQ 掉线只提醒不自动重启（/看门狗 查｜重启｜自动重启）",
-    "1.1.0",
+    "1.1.1",
 )
 class NapCatWatchdogPlugin(Star):
     """Watches the NapCat↔AstrBot link and tells you when it drops (no auto-restart)."""
@@ -65,6 +68,9 @@ class NapCatWatchdogPlugin(Star):
         self._task: asyncio.Task | None = None
         self._last_result = "还没检查过"
         self._last_check_at = 0.0
+        self._logged_result: str | None = None
+        self._logged_at = 0.0
+        self._logged_error = ""
 
     async def initialize(self) -> None:
         """Start the background check loop."""
@@ -86,18 +92,47 @@ class NapCatWatchdogPlugin(Star):
     async def _check(self, dry_run: bool = False) -> str:
         """Run one check in a worker thread (netstat/tasklist are blocking).
 
+        Reports the result the same way every time, but only writes to the log
+        when the outcome changes or after ``LOG_REPEAT_SECONDS``: a long cooldown
+        used to produce a warning every two minutes and bury real errors.
+
         Args:
             dry_run: Only report, do not restart anything.
 
         Returns:
             The result summary.
         """
-        result = await asyncio.to_thread(self._module.check_once, dry_run)
-        self._last_result = str(result)
+        try:
+            result = str(await asyncio.to_thread(self._module.check_once, dry_run))
+        except Exception as exc:  # noqa: BLE001 - 报告出错，循环继续
+            # Log the traceback once per distinct failure. AstrBot's own handler
+            # records only the message, which is why this was opaque before.
+            detail = f"{type(exc).__name__}: {exc}"
+            if detail != self._logged_error:
+                self._logged_error = detail
+                logger.error(
+                    f"napcat_watchdog: 检查出错 {detail}\n{traceback.format_exc()}"
+                )
+            self._last_result = "检查出错"
+            self._last_check_at = time.time()
+            return self._last_result
+        self._logged_error = ""
+        self._last_result = result
         self._last_check_at = time.time()
-        if result not in {"在线"}:
+        now = self._last_check_at
+        if result == "在线":
+            if self._logged_result not in (None, "在线"):
+                logger.info(
+                    f"napcat_watchdog: 已恢复（上一状态：{self._logged_result}）"
+                )
+            self._logged_result = result
+            self._logged_at = now
+            return result
+        if result != self._logged_result or now - self._logged_at >= LOG_REPEAT_SECONDS:
             logger.warning(f"napcat_watchdog: {result}")
-        return self._last_result
+            self._logged_result = result
+            self._logged_at = now
+        return result
 
     @filter.command("看门狗")
     async def watchdog_command(self, event: AstrMessageEvent):

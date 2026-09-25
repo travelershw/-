@@ -22,15 +22,19 @@ from datetime import datetime
 from pathlib import Path
 
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core import logger
+from astrbot.core.agent.message import TextPart
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from . import (
     chance,
     decide,
     express,
+    holiday,
     memory,
     nightly,
     petlog,
@@ -51,12 +55,26 @@ GOSSIP_AFTER = ("又", "还", "也", "已经", "都", "就", "好像", "真的",
 # 但也不能把群里随后的任何一条都算成找她——所以要求"紧接着她那一轮、中间没人插话"。
 CONTINUATION_SECONDS = 90
 CONTINUATION_MAX_CHARS = 25
+# 免@ 窗口的**绝对截止时间**（存进 meta，单位是秒级时间戳）。
+# 只有她"自己拿到话头"的那一轮才刷新它：被接话规则唤醒后的回复不再刷新。
+# 否则每回一次就把锚点往后推一次，群友只要 90 秒内接一句她就能一直不用 @——
+# 2026-09-22 实测出现过连续 3.5 分钟都在免@ 状态的情况，比设定的 90 秒长得多。
+CONTINUATION_UNTIL_KEY = "continuation_until:{group}"
+# 超过这么久才算"积压消息"：电脑休眠或进程卡住之后解冻时，几小时前的群消息
+# 会在几秒内一次性涌进来。这种旧消息不该把她唤醒，否则她会连着回复一堆过期内容
+# （2026-09-23 22:51 实测：事件循环卡了 4.5 小时后解冻，上百条旧消息一秒内到达）。
+STALE_MESSAGE_SECONDS = 120
+# 同一句话在这段时间内又要发一次，就当重复、拦掉不发。
+# 为什么会重复：模型在同一轮里既能给正文又能调工具，AstrBot 先把正文发出去、执行完工具
+# 再问一次，模型把同样的话又输出了一遍（2026-09-24 实测 update_affection 那轮，间隔 3 秒
+# 发了两条一模一样的）。
+DUPLICATE_REPLY_SECONDS = 20
 # 表达层开关：回复前的停顿、闲聊时偶尔只回一句、插嘴时的"说短点"提示。
 # 只改"怎么说话"，不改"说不说话"，一直开着。
 EXPRESS_ENFORCE = True
 # 插嘴写超了要不要让她重写一句（多花一次模型调用，但比"事后截断"自然）。
 CHIME_REWRITE = True
-PLUGIN_VERSION = "0.17.1"
+PLUGIN_VERSION = "0.19.0"
 # 决策只对真实聊天生效，这些平台不参与。
 SKIP_PLATFORMS = ("webchat",)
 # 好感度还由旧插件写 JSON，这里定期镜像进 relations 表（阶段 C 会搬过来）。
@@ -79,6 +97,7 @@ USAGE = (
     "· /轻语状态　看她今天的状态与决策分布（管理员）\n"
     "· /轻语周报　看最近一周的评估数据（管理员）\n"
     "· /插嘴阈值　看/临时改插嘴门槛与机会点门槛（管理员）\n"
+    "· /祝福　看今天是什么节、本群开没开、发过没；/祝福 列表 看节日表（管理员）\n"
     "· /风格　看学到的群味（每群的插嘴上限、答话上限）；/风格 重建 立刻重建\n"
     "· /风格 老师　看学习对象（谁在贡献样本）；加：/风格 老师 加 10001（QQ 或昵称都行）"
 )
@@ -89,6 +108,16 @@ TEACHER_USAGE = (
     "· /风格 老师　看当前学习对象\n"
     "· /风格 老师 加 10001　加一个（也可以写 /风格 老师 加10001）\n"
     "· /风格 老师 删 10001　移除一个"
+)
+
+
+HOLIDAY_USAGE = (
+    "用法：\n"
+    "· /祝福　看今天是什么节、本群开没开、今天发过没\n"
+    "· /祝福 开　/祝福 关　开关本群的节日祝福\n"
+    "· /祝福 试 [节日名]　只在本群演练一次，便于调语气\n"
+    "· /祝福 列表　看节日表（含窗口、级别、主动发的节日）\n"
+    "· /祝福 设 2027-02-06 春节　补一条农历日期"
 )
 
 
@@ -156,6 +185,8 @@ class QingyuCorePlugin(Star):
         self._db = store.connect()
         self._background_tasks: set[asyncio.Task] = set()
         self._closing = False
+        # 每个会话最近一次发出去的正文：用来识别"同一句话短时间内又发一遍"。
+        self._last_reply: dict[str, tuple[str, float]] = {}
         self._last_sync = 0.0
         self._extracting: set[str] = set()
         self._last_observe_log: dict[str, float] = {}
@@ -165,6 +196,12 @@ class QingyuCorePlugin(Star):
         synced = world.sync_affection(self._db)
         # 群味卡片（L1）：启动时后台建一次，缺了/过期了运行时会自己补，不阻塞消息处理。
         self._style_task = asyncio.create_task(self._warm_style())
+        # Holiday greetings (mode B): 除夕/元旦/春节 do not wait for anyone to
+        # speak, so a background task re-checks every few minutes. It rides the
+        # same task set as the other background work, so terminate() cancels it.
+        task = asyncio.create_task(self._holiday_loop())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
         logger.info(
             f"qingyu_core: 启动（决策{'生效' if ENFORCE else '只评估，不插话不静默'}／"
             f"表达{'生效' if EXPRESS_ENFORCE else '关闭'}），"
@@ -262,8 +299,19 @@ class QingyuCorePlugin(Star):
         #   2. **她刚开口、紧接着这一条**（见 _continuation_reason）——QQ 里接着聊的人往往
         #      既不 @ 也不引用，只能按"接力的位置"认：紧接她那一轮、中间没人插话、90 秒内、像在接话；
         #   3. 平台自己能认出来的（@ 到她、Reply.sender_id 是她）本来就已经置位了，这里不重复处理。
-        addressing = self._addressing_reason(event)
-        if not addressing:
+        # 积压消息（休眠解冻后一次性涌进来的旧消息）不参与唤醒与插嘴判定：
+        # 她的规则都建立在"刚刚在聊什么"上，对几小时前的消息一律不成立。
+        age = self._message_age(event)
+        stale = age is not None and age > STALE_MESSAGE_SECONDS
+        if stale:
+            logger.info(
+                f"qingyu_core: 这条消息已经 {int(age)} 秒了（积压/解冻），不把她唤醒"
+            )
+
+        addressing = "" if stale else self._addressing_reason(event)
+        # 这一次唤醒是不是"接话规则"给的——决定要不要续期免@ 窗口（见下方 note_bot_spoke）。
+        from_continuation = False
+        if not addressing and not stale:
             # 她刚开口、紧接着这一条 —— 群友不用 @ 也能接着跟她聊（见 _continuation_reason）。
             addressing = self._continuation_reason(
                 umo=umo,
@@ -273,6 +321,7 @@ class QingyuCorePlugin(Star):
                 messages=list(event.get_messages() or []),
                 self_id=self_id,
             )
+            from_continuation = bool(addressing)
         if addressing and not event.is_at_or_wake_command:
             event.is_at_or_wake_command = True
             event.is_wake = True
@@ -280,6 +329,36 @@ class QingyuCorePlugin(Star):
             logger.info(
                 f"qingyu_core: 这条算在叫她（{addressing}），核心补了唤醒（不用等 @）"
             )
+
+        # Holiday greeting (mode A): the first message inside the window wakes her
+        # so she says it herself. The window, the level switch and the "already
+        # greeted" check all live in holiday.pending (any moment inside the window
+        # counts as a same-day catch-up). The bookkeeping happens on the wake side:
+        # without it every later message in the window would wake her again.
+        if (
+            group_id
+            and not stale
+            and not is_command
+            and not event.is_at_or_wake_command
+            and self._holiday_group_wanted(group_id, umo)
+        ):
+            greeting = holiday.pending(self._db, group_id)
+            gap = world.seconds_since_bot(self._db, umo, ts) if greeting else 0.0
+            if greeting and gap >= holiday.min_gap_seconds():
+                holiday.mark_greeted(
+                    self._db,
+                    group_id,
+                    greeting["name"],
+                    greeting["date"],
+                    ts,
+                )
+                event.is_at_or_wake_command = True
+                event.is_wake = True
+                event.set_extra("qingyu.holiday", greeting["name"])
+                logger.info(
+                    f"qingyu_core: holiday {greeting['name']} wakeup in {group_id}"
+                    f" (last spoke {int(gap)}s ago, window {greeting['window']})"
+                )
 
         # 机会点（L2）：这一条值不值得接——按本群学到的"群里的人此刻会不会说话"来算。
         # 只对"没被点名、也不是指令"的消息算：被点名走 respond，不需要机会点。
@@ -292,7 +371,7 @@ class QingyuCorePlugin(Star):
             is_wake=bool(event.is_at_or_wake_command),
             is_command=is_command,
             chime_allowed=self._chime_wanted(umo),
-            chime_due=bool(event.get_extra("qingyu.chime_due")),
+            chime_due=bool(event.get_extra("qingyu.chime_due")) and not stale,
             repeat_asker=world.repeat_asker(self._db, umo, uid, ts),
             enforcing=ENFORCE,
             chime_at=tuning.chime_at(),
@@ -350,6 +429,14 @@ class QingyuCorePlugin(Star):
             and not (is_command and plan.action == "respond")
         ):
             world.note_bot_spoke(self._db, group_id, ts)
+            # 只有她自己拿到话头的那一轮才重新开一个 90 秒免@ 窗口；
+            # 靠接话被唤醒后的回复不再续期，否则窗口会无限往后滑。
+            if not from_continuation:
+                store.set_meta(
+                    self._db,
+                    CONTINUATION_UNTIL_KEY.format(group=group_id),
+                    str(ts + CONTINUATION_SECONDS),
+                )
 
     @filter.on_using_llm_tool()
     async def note_tool_use(
@@ -394,6 +481,21 @@ class QingyuCorePlugin(Star):
         plan = event.get_extra("qingyu.plan")
         action = getattr(plan, "action", "")
         umo = event.unified_msg_origin
+        # 重复正文拦掉：工具循环会让模型把同一句再说一次，看着像她结巴了。
+        # 清空消息链后 respond 阶段会因"消息为空"直接跳过发送（见 stage.py 的空链判断）。
+        now = time.monotonic()
+        previous = self._last_reply.get(umo)
+        if (
+            previous
+            and previous[0] == text
+            and 0 <= now - previous[1] <= DUPLICATE_REPLY_SECONDS
+        ):
+            logger.info(
+                f"qingyu_core: 同一句话 {now - previous[1]:.1f} 秒内重复，这次不发：{text[:24]}"
+            )
+            result.chain = []
+            return
+        self._last_reply[umo] = (text, now)
         group_id = str(event.get_group_id() or "")
         if not group_id:
             # 私聊/面板的回复不进事件流：桌宠的气泡只讲"她在群里干了什么"。
@@ -474,13 +576,20 @@ class QingyuCorePlugin(Star):
         # 群里一条会话是好几个人共用的、消息本身又不带署名，不先钉死"这轮谁在说"，
         # 她就会把提问的人认成上一条消息的主角——2026-09-17 群里连着两个人问
         # "我是谁"，她两次都答"你是示例用户"，就是这么翻车的。
+        # Per-turn text goes to the tail of the user content instead of the system
+        # prompt: the system prompt must stay byte-identical so the provider can
+        # reuse its prefix cache for the conversation history.
         if group_id and uid:
             about = ""
             if snapshot:
                 about = f"，好感 {snapshot.person.affection}、照过 {snapshot.person.familiarity} 次面"
-            req.system_prompt = (
-                f"{prompt}\n【这一轮跟你说话的是「{nickname or uid}」"
-                f"（QQ {uid}{about}），回答时认准这个人，别认错。】"
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text=(
+                        f"【这一轮跟你说话的是「{nickname or uid}」"
+                        f"（QQ {uid}{about}），回答时认准这个人，别认错。】"
+                    ),
+                ),
             )
             if "User ID:" not in prompt:
                 logger.info(
@@ -492,10 +601,13 @@ class QingyuCorePlugin(Star):
         # 模型不知道 85 和 45 在语气上该有什么差别（用户反馈"好感度的作用被拉低"）。
         if snapshot:
             label, _multiplier, flavor = style.flavor_for(snapshot.person.affection)
-            req.system_prompt = (
-                f"{req.system_prompt or ''}\n"
-                f"【你跟「{snapshot.person.nickname or uid or '对方'}」的关系："
-                f"好感 {snapshot.person.affection}/100（{label}）→ {flavor}】"
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text=(
+                        f"【你跟「{snapshot.person.nickname or uid or '对方'}」的关系："
+                        f"好感 {snapshot.person.affection}/100（{label}）→ {flavor}】"
+                    ),
+                ),
             )
         # 不依赖感知链：面板会话等被感知链跳过的场合，也照样能把旧事带上。
         if plan is not None and not plan.recall_needed:
@@ -517,7 +629,7 @@ class QingyuCorePlugin(Star):
                 )
             }
         block = memory.format_for_prompt(picked, nickname, names, uid)
-        req.system_prompt = (req.system_prompt or "") + "\n" + block
+        req.extra_user_content_parts.append(TextPart(text="\n" + block))
         memory.mark_used(self._db, [int(item["id"]) for item in picked])
         if turn_id:
             memory.log_recall(self._db, turn_id, [int(item["id"]) for item in picked])
@@ -579,7 +691,7 @@ class QingyuCorePlugin(Star):
         )
         if not hint:
             return
-        req.system_prompt = (req.system_prompt or "") + "\n" + hint
+        req.extra_user_content_parts.append(TextPart(text="\n" + hint))
         event.set_extra("qingyu.style_hint", hint[:24])
         if plan is not None and plan.action == "refuse":
             logger.info(
@@ -603,6 +715,31 @@ class QingyuCorePlugin(Star):
             logger.info(f"qingyu_core: 这轮加了长度提示（上限 {plan.max_chars} 字）")
         else:
             logger.info("qingyu_core: 这轮让她偷懒，只回一句")
+
+    @filter.on_llm_request()
+    async def inject_holiday(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """Tell the model which holiday it is when the greeting was triggered.
+
+        The wording is shared with the proactive path (see
+        :func:`holiday.greet_instruction`) so both greetings sound the same.
+
+        Args:
+            event: Message event of this model request.
+            req: The request that is about to be sent.
+        """
+        name = str(event.get_extra("qingyu.holiday") or "")
+        if not name:
+            return
+        group_id = str(event.get_group_id() or "")
+        cap = express.chime_length_cap(group_id)
+        req.extra_user_content_parts.append(
+            TextPart(text="\n" + holiday.greet_instruction(name, cap)),
+        )
+        logger.info(
+            f"qingyu_core: holiday greeting hint injected ({name}, {cap} chars)"
+        )
 
     @filter.on_decorating_result()
     async def delay_before_send(self, event: AstrMessageEvent) -> None:
@@ -964,6 +1101,117 @@ class QingyuCorePlugin(Star):
             return
         yield event.plain_result(style.summary(group_id)[:REPORT_MAX_CHARS])
 
+    @filter.command("祝福")
+    async def holiday_command(self, event: AstrMessageEvent):
+        """Show or change the holiday greetings (admin only).
+
+        Usage: ``/祝福`` reports today's holiday, this group's switch and whether
+        it was greeted; ``/祝福 开`` / ``/祝福 关`` flip this group;
+        ``/祝福 试 [节日名]`` rehearses once here; ``/祝福 列表`` shows the
+        holiday table; ``/祝福 设 2027-02-06 春节`` adds one lunar date.
+
+        Args:
+            event: Command message event.
+
+        Yields:
+            Status text or the result of the change.
+        """
+        if not event.is_admin():
+            yield event.plain_result("这个只有管理员能用哦~")
+            return
+        argument = (event.message_str or "").replace("祝福", "", 1).strip()
+        group_id = str(event.get_group_id() or "")
+        if argument.startswith("设"):
+            parts = argument.replace("设", "", 1).split()
+            if len(parts) < 2:
+                yield event.plain_result("用法：/祝福 设 2027-02-06 春节")
+                return
+            entry, message = holiday.save_date(parts[0], parts[1])
+            if entry:
+                logger.info(
+                    f"qingyu_core: holiday date saved {entry['date']} "
+                    f"{entry['name']} level={entry['level']}",
+                )
+            yield event.plain_result(message)
+            return
+        if argument.startswith("列表"):
+            yield event.plain_result(holiday.table_text()[:REPORT_MAX_CHARS])
+            return
+        if argument.startswith("试"):
+            if not group_id:
+                yield event.plain_result("演练要在群里用，私聊里没有群味可参照。")
+                return
+            name = argument.replace("试", "", 1).strip()
+            if not name:
+                today = holiday.today()
+                name = today[0]["name"] if today else ""
+            if not name:
+                yield event.plain_result(
+                    "今天不是节日。想演练就带上名字：/祝福 试 中秋",
+                )
+                return
+            cap = express.chime_length_cap(group_id)
+            text = await self._holiday_greeting_text(
+                name, event.unified_msg_origin, group_id
+            )
+            if not text:
+                yield event.plain_result(
+                    "没生成出来（没有可用模型或调用失败），日志里有原因。",
+                )
+                return
+            yield event.plain_result(
+                f"演练一次（{name}，{len(text)} 字／上限 {cap}）：\n{text}\n"
+                "这次只在这里回，不记账、不进群。",
+            )
+            return
+        if argument in {"开", "打开", "on"} or argument in {"关", "关闭", "off"}:
+            if not group_id:
+                yield event.plain_result("这个要在群里用：在哪个群发就在哪个群开关。")
+                return
+            yield event.plain_result(
+                holiday.set_group(group_id, argument in {"开", "打开", "on"}),
+            )
+            return
+        if argument:
+            yield event.plain_result(HOLIDAY_USAGE)
+            return
+        now = datetime.now()
+        entries = holiday.today(now)
+        if entries:
+            lines = [
+                f"今天是{entry['name']}（level {entry['level']}，窗口 {entry['window']}，"
+                "当天补发：窗口内随时可发）"
+                for entry in entries
+            ]
+        else:
+            lines = [
+                f"今天（{now.date().isoformat()}）不是节日：公历表里没有，"
+                "配置的农历日期里也没有今天。"
+            ]
+        offset = holiday.group_override(group_id)
+        wanted = self._holiday_group_wanted(group_id, event.unified_msg_origin)
+        source = "配置里显式指定" if offset is not None else "跟随插嘴白名单"
+        lines.append(f"本群祝福：{'开' if wanted else '关'}（{source}）")
+        if group_id and entries:
+            for entry in entries:
+                done = holiday.already_greeted(
+                    self._db,
+                    group_id,
+                    entry["name"],
+                    entry["date"],
+                )
+                lines.append(
+                    f"· {entry['name']}：{'今天已经发过' if done else '今天还没发'}"
+                )
+        lines.append(f"插嘴白名单里的会话：{len(self._chime_sessions())} 个")
+        lines.append(
+            f"农历日期共 {len(holiday.load()['dates'])} 条（/祝福 列表 看节日表）"
+        )
+        lines.append(
+            "改法：/祝福 开　/祝福 关　/祝福 试　/祝福 列表　/祝福 设 2027-02-06 春节"
+        )
+        yield event.plain_result("\n".join(lines)[:MAX_CHARS])
+
     @filter.on_decorating_result(priority=110)
     async def shorten_over_long(self, event: AstrMessageEvent) -> None:
         """写太长了就让她重写一句（**不是**事后截断）。
@@ -1101,6 +1349,152 @@ class QingyuCorePlugin(Star):
         finally:
             self._extracting.discard(group_id)
 
+    async def _holiday_loop(self) -> None:
+        """Proactively greet mode-B holidays while the plugin is loaded.
+
+        Mode B (除夕/元旦/春节) does not wait for anybody to speak: this loop
+        re-checks every few minutes. It never returns and dies only when
+        ``terminate`` cancels it through ``_background_tasks``.
+        """
+        while not self._closing:
+            try:
+                await self._greet_mode_b()
+            except Exception as exc:  # noqa: BLE001 - the loop must survive failures
+                logger.warning(
+                    f"qingyu_core: holiday task failed: {type(exc).__name__}: {exc}"
+                )
+            await asyncio.sleep(holiday.MODE_B_INTERVAL_SECONDS)
+
+    async def _greet_mode_b(self) -> None:
+        """Greet every enabled group that still owes a mode-B holiday greeting.
+
+        A group only counts when it has been active recently: waking up a silent
+        group with a greeting out of nowhere is worse than skipping the holiday.
+        """
+        ts = store.now()
+        for group_id, umo in self._known_groups():
+            if self._closing:
+                return
+            if not self._holiday_group_wanted(group_id, umo):
+                continue
+            active = world.recent_message_count(
+                self._db,
+                umo,
+                ts,
+                holiday.ACTIVE_WINDOW_SECONDS,
+            )
+            if not active:
+                continue
+            entry = holiday.pending(self._db, group_id, mode_b=True)
+            if not entry:
+                continue
+            text = await self._holiday_greeting_text(entry["name"], umo, group_id)
+            if not text:
+                continue
+            try:
+                sent = await self.context.send_message(
+                    umo,
+                    MessageChain([Plain(text)]),
+                )
+            except Exception as exc:  # noqa: BLE001 - one group must not stop the others
+                logger.warning(
+                    f"qingyu_core: holiday greeting send failed for {group_id} "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                continue
+            if not sent:
+                logger.warning(
+                    f"qingyu_core: holiday greeting not sent, no platform for {umo}"
+                )
+                continue
+            holiday.mark_greeted(self._db, group_id, entry["name"], entry["date"], ts)
+            # A proactive send does not travel through the event pipeline, so the
+            # desktop pet's "what she just said" stream needs this row by hand.
+            petlog.log(
+                self._db,
+                kind="speak",
+                text=text,
+                umo=umo,
+                group_id=group_id,
+                extra={"holiday": entry["name"]},
+                ts=ts,
+            )
+            logger.info(
+                f"qingyu_core: holiday {entry['name']} greeting sent to {group_id}"
+            )
+
+    async def _holiday_greeting_text(
+        self,
+        name: str,
+        umo: str,
+        group_id: str,
+    ) -> str:
+        """Ask the model for one holiday line (used by mode B and ``/祝福 试``).
+
+        This is a standalone call, not a turn of the group conversation, so the
+        persona plus the greeting instruction go into ``system_prompt``; the
+        group style caps the length.
+
+        Args:
+            name: Holiday name.
+            umo: Session used to pick the provider and the persona.
+            group_id: Group whose style caps the length.
+
+        Returns:
+            The greeting text, or an empty string when it cannot be generated.
+        """
+        provider = self.context.get_using_provider(umo=umo)
+        if provider is None:
+            logger.warning("qingyu_core: no provider, skip the holiday greeting")
+            return ""
+        persona = ""
+        try:
+            result = await self.context.persona_manager.get_default_persona_v3(umo=umo)
+            # get_default_persona_v3 returns a dict in this version (Personality
+            # is a TypedDict), but keep attribute access working as a fallback.
+            if isinstance(result, dict):
+                persona = str(result.get("prompt") or "")
+            else:
+                persona = str(getattr(result, "prompt", "") or "")
+        except Exception as exc:  # noqa: BLE001 - 读不到人设也还能发一句
+            logger.warning(
+                f"qingyu_core: holiday greeting persona unreadable "
+                f"({type(exc).__name__}), sending without it"
+            )
+        cap = express.chime_length_cap(group_id)
+        system_prompt = f"{persona}\n\n{holiday.greet_instruction(name, cap)}".strip()
+        try:
+            response = await provider.text_chat(
+                prompt=holiday.greet_prompt(name),
+                system_prompt=system_prompt,
+            )
+        except Exception as exc:  # noqa: BLE001 - 生成失败就静默跳过这一轮
+            logger.warning(
+                f"qingyu_core: holiday greeting call failed "
+                f"({type(exc).__name__}: {exc})"
+            )
+            return ""
+        return (
+            str(getattr(response, "completion_text", "") or "").strip().strip("「」\"'")
+        )
+
+    def _holiday_group_wanted(self, group_id: str, umo: str) -> bool:
+        """Whether holiday greetings are on for this group.
+
+        Args:
+            group_id: Platform group id.
+            umo: Unified message origin; it decides the switch when the config
+                does not list this group explicitly.
+
+        Returns:
+            True when the config lists the group as on, False when it lists it as
+            off, otherwise the interjection whitelist decides.
+        """
+        override = holiday.group_override(group_id)
+        if override is not None:
+            return override
+        return self._chime_wanted(umo)
+
     def _maybe_weekly_report(self, ts: int) -> None:
         """每周自动出一份周报（同一周只出一次，写进 meta 并落日志）。
 
@@ -1133,20 +1527,30 @@ class QingyuCorePlugin(Star):
                     return True
         return False
 
-    def _chime_wanted(self, umo: str) -> bool:
-        """读插嘴白名单，判断本会话是否放行插嘴。
-
-        Args:
-            umo: 会话标识。
+    def _chime_sessions(self) -> set[str]:
+        """Read the interjection whitelist written by random_chime.
 
         Returns:
-            True 表示允许插嘴。
+            The enabled session ids; an empty set when the file is missing or
+            broken.
         """
         try:
             data = json.loads(CHIME_STATE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return False
-        return umo in {str(item) for item in data.get("enabled_sessions", [])}
+            return set()
+        return {str(item) for item in data.get("enabled_sessions", [])}
+
+    def _chime_wanted(self, umo: str) -> bool:
+        """Whether this session is allowed to interject.
+
+        Args:
+            umo: Unified message origin.
+
+        Returns:
+            True when the session is whitelisted (holiday greetings follow it by
+            default as well).
+        """
+        return umo in self._chime_sessions()
 
     def _self_names(self) -> set[str]:
         """她在这个机器人里可能被叫到的名字（人设名 + 从引用里学到的昵称）。
@@ -1289,6 +1693,15 @@ class QingyuCorePlugin(Star):
         """
         if not group_id:
             return ""
+        # 窗口到期时间是绝对时间戳，由她"自己拿到话头"的那一轮写入；
+        # 不能按"离她上一轮多久"来判，否则她的每一次接话回复都会把窗口续期。
+        deadline = store.get_meta(
+            self._db,
+            CONTINUATION_UNTIL_KEY.format(group=group_id),
+            "",
+        )
+        if not deadline.isdigit() or ts > int(deadline):
+            return ""
         recent = world.recent_messages(self._db, group_id, limit=2)
         if not recent:
             return ""
@@ -1296,7 +1709,7 @@ class QingyuCorePlugin(Star):
         if str(previous.get("action") or "") not in {"respond", "chime", "refuse"}:
             return ""
         gap = ts - int(previous.get("ts") or 0)
-        if not 0 < gap <= CONTINUATION_SECONDS:
+        if gap <= 0:
             return ""
         for part in messages:
             if (
@@ -1307,6 +1720,30 @@ class QingyuCorePlugin(Star):
         if any(char in text for char in "?？") or len(text) <= CONTINUATION_MAX_CHARS:
             return f"她 {gap} 秒前刚开口，这是紧接着的一条"
         return ""
+
+    def _message_age(self, event: AstrMessageEvent) -> float | None:
+        """How long ago the platform says this message was actually sent.
+
+        解冻积压靠这个区分：事件到达时间都一样，只有原始发送时间能看出它是旧消息。
+
+        Args:
+            event: 消息事件。
+
+        Returns:
+            秒数；平台没给原始时间时返回 None。
+        """
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if isinstance(raw, dict):
+            sent_at = raw.get("time")
+        elif raw is not None:
+            sent_at = getattr(raw, "time", None)
+        else:
+            return None
+        if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+            return None
+        if sent_at <= 0:
+            return None
+        return max(0.0, time.time() - float(sent_at))
 
     def _resolve_uid(self, target: str) -> str:
         """把用户填的 QQ 号或昵称解析成 uid。

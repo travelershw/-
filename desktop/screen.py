@@ -23,6 +23,37 @@ SHOTS = paths.SHOTS
 # 传给模型前先缩到这个宽度（屏幕 1440 宽的话基本是原尺寸；4K/多屏时才明显缩小）
 MAX_WIDTH = 1600
 KEEP_SHOTS = 20
+# 图片格式：默认 PNG（截图里常有小字，无损更稳），可切成 JPEG 换上传速度。
+# 为什么值得切：这张图 base64 之后**要上传到模型服务商**，上行体积直接决定"读图"的等待；
+# 实拍的照片/画面类截图 JPEG 通常只有 PNG 的几分之一（纯文字截图两边差不多）。
+JPEG_QUALITY = 92
+
+
+def normalize_format(value: str | None) -> str:
+    """Map a user setting onto a supported format name.
+
+    Args:
+        value: Raw setting (``"png"``, ``"jpeg"``, ``"jpg"``, anything else).
+
+    Returns:
+        Either ``"png"`` or ``"jpeg"``.
+    """
+    text = str(value or "").strip().lower()
+    return "jpeg" if text in {"jpeg", "jpg"} else "png"
+
+
+def shot_path(stamp: str, image_format: str | None = None) -> Path:
+    """Where a screenshot with this timestamp should be written.
+
+    Args:
+        stamp: Timestamp text (``%m%d_%H%M%S``).
+        image_format: Format setting; PNG when omitted.
+
+    Returns:
+        The full path (suffix follows the format).
+    """
+    suffix = ".jpg" if normalize_format(image_format) == "jpeg" else ".png"
+    return SHOTS / f"shot_{stamp}{suffix}"
 
 
 @dataclass
@@ -60,12 +91,17 @@ def _grab_screen(screen) -> QPixmap:  # noqa: ANN001 - QScreen
     return screen.grabWindow(0)
 
 
-def capture(which: str = "primary", hide: bool = False) -> Shot:
+def capture(
+    which: str = "primary",
+    hide: bool = False,
+    image_format: str | None = None,
+) -> Shot:
     """Take a screenshot of the primary screen or of every screen combined.
 
     Args:
         which: ``primary``（鼠标所在的那块屏）或 ``all``（所有屏拼成一张）.
         hide: 抓之前先让调用方把窗口藏起来（由调用方负责，参数只用于日志）.
+        image_format: ``png``（默认，无损）或 ``jpeg``（上传更快）.
 
     Returns:
         The captured shot (``error`` set on failure).
@@ -114,21 +150,26 @@ def capture(which: str = "primary", hide: bool = False) -> Shot:
     if image.width() > MAX_WIDTH:
         image = image.scaledToWidth(MAX_WIDTH, Qt.SmoothTransformation)
     SHOTS.mkdir(parents=True, exist_ok=True)
-    path = SHOTS / f"shot_{time.strftime('%m%d_%H%M%S')}.png"
-    if not image.save(str(path), "PNG"):
+    path = shot_path(time.strftime("%m%d_%H%M%S"), image_format)
+    if normalize_format(image_format) == "jpeg":
+        written = image.save(str(path), "JPEG", JPEG_QUALITY)
+    else:
+        written = image.save(str(path), "PNG")
+    if not written:
         shot.error = "写文件失败"
         return shot
     shot.path = str(path)
     shot.width = image.width()
     shot.height = image.height()
     shot.bytes = path.stat().st_size
+    shot.label = f"{shot.label}（{path.suffix.lstrip('.')}）"
     _trim()
     return shot
 
 
 def _trim() -> None:
-    """Keep only the newest ``KEEP_SHOTS`` screenshots."""
-    files = sorted(SHOTS.glob("shot_*.png"), key=lambda path: path.stat().st_mtime)
+    """Keep only the newest ``KEEP_SHOTS`` screenshots (PNG and JPEG alike)."""
+    files = sorted(SHOTS.glob("shot_*"), key=lambda path: path.stat().st_mtime)
     for path in files[:-KEEP_SHOTS]:
         try:
             path.unlink()
