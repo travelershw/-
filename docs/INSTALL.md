@@ -150,12 +150,15 @@ cd desktop
 ### 4. 看门狗插件（napcat_watchdog）
 
 - 运行逻辑**内置**在插件目录内的 `watchdog_runtime.py`，不依赖 `vendor/AstrBot/migration_tools`（该目录已从 vendor 中排除）。
-- **默认 notify-only**：掉线只提醒（Windows 弹窗 + 日志 + 桌宠提示），**不自动重启 QQ**
-  （公开版把 `AUTO_RESTART` 置为 `False`；作者本机是自己开着的，这个是发布默认值）。
-  需要自动恢复时用 `/看门狗 自动重启 开` 自行打开，并注意下面的风险与节流参数。
-- **节流参数**（`watchdog_runtime.py` 顶部）：`RESTART_COOLDOWN_MINUTES = 60`、
-  `MAX_RESTARTS_PER_HOUR = 1`、`ALLOW_KILL_ALL_QQ = False`（只结束"正托管着 NapCat 的那个 PID"，
-  不做"杀掉所有 QQ 进程"这种事）。
+- **默认 notify-only**：掉线只提醒（Windows 弹窗 + 日志 + 桌宠提示），**不自动重启 QQ**。
+  需要自动恢复时用 `/看门狗 自动重启 开`（**只对当前这次运行有效**，重载插件即失效），
+  或自己把常量改成 `True`；改之前请读下面的风险与节流参数。
+- **为什么不默认自动重启**：判定掉线后重启会**结束正在跑的 QQ 再重新注入**，
+  你正在聊天/切号时会被打断；而且"被踢"本身很可能是服务端风险控制，
+  每次重新注入都是新的登录动作，**越自动越可能加重风控**。
+- **节流参数**（`watchdog_runtime.py` 顶部，只在自动重启打开时才起作用）：
+  `RESTART_COOLDOWN_MINUTES = 60`、`MAX_RESTARTS_PER_HOUR = 1`、`ALLOW_KILL_ALL_QQ = False`
+  （只结束"正托管着 NapCat 的那个 PID"，不做"杀掉所有 QQ 进程"这种事）。
 - **手动重启 QQ 有风险**：自动/手动重启会结束当前 QQ 再拉起，可能打断你正在进行的会话，请谨慎使用。
 - **仅 Windows**：依赖 NapCat 注入 QQNT 的方式（`napimain.exe` / `napiloader.dll` 等）。
 - 需配置环境变量：
