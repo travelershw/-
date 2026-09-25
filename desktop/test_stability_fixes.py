@@ -117,6 +117,31 @@ def test_setup_button_re_enables_on_exception() -> None:
     assert "boom" in dialog.status.text()
 
 
+def test_setup_dialog_opens_in_every_mode() -> None:
+    """The dialog must build in all three modes (it used to crash in AstrBot mode).
+
+    真实事故（2026-09-25 16:34:42）：用户点「设置」直接崩——
+    ``mode.currentTextChanged`` 在控件建好之前就连上了 ``_sync``，
+    而构造里给"连 AstrBot"模式调 ``setCurrentText`` 会立刻触发它，此时 ``self.llm_box``
+    还不存在。这里把三种模式都构造一遍，顺便验证联动开关仍然生效。
+    """
+    ensure_app()
+    for config in (
+        {"mode": "local"},
+        {"mode": "astrbot", "desktop_url": "ws://127.0.0.1:6198"},
+        {"mode": "astrbot", "desktop_url": "ws://10.0.0.9:6198"},
+    ):
+        dialog = setup_window.SetupDialog(dict(config))
+        # 切换运行方式要能实时联动（连接必须还在，只是挪到了控件建好之后）
+        dialog.mode.setCurrentText(setup_window.MODE_LOCAL)
+        assert dialog.llm_box.isEnabled()
+        assert not dialog.link_box.isEnabled()
+        dialog.mode.setCurrentText(setup_window.MODE_OWN)
+        assert not dialog.llm_box.isEnabled()
+        assert dialog.link_box.isEnabled()
+        dialog.deleteLater()
+
+
 # --------------------------------------------------------------------------
 # Fix 3: _session retrieves exceptions, cancels/awaits pending, no reconnect.
 # --------------------------------------------------------------------------

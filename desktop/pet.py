@@ -12,6 +12,7 @@ import random
 import sys
 import threading
 import time
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -23,16 +24,27 @@ from PySide6.QtGui import (
     QPainter,
     QPixmap,
 )
-from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QInputDialog,
+    QLineEdit,
+    QMenu,
+    QSystemTrayIcon,
+    QWidget,
+)
 
+import asr
 import camera
 import faces
+import listening
+import microphone
 import paths
 import pc_state
 import screen
 import sprite
 import state as state_mod
 import weather
+from asr import ASRError
 from bubble import Bubble
 from chat import ChatClient, ChatWindow
 from petlink import PetLinkClient
@@ -90,6 +102,10 @@ class NetSignals(QObject):
 
     weather = Signal(object)  # weather.Weather
     place = Signal(object, str)  # (list[weather.Place], 错误文本), 查询用的原文
+    heard = Signal(object, str, str)  # (microphone.Clip, 转写文字, 错误文本)
+    model = Signal(str, str)  # (下载结果文本, 错误文本)
+    model_progress = Signal(int, int)  # 已下字节, 总字节
+    transcribed = Signal(str, str, str)  # (wav 路径, 文字, 错误文本) —— 对话模式专用
 
 
 def fetch_weather(lat: float, lon: float, place: str):  # noqa: ANN202 - weather.Weather
@@ -133,6 +149,121 @@ def fetch_places(query: str) -> tuple[list, str]:
         return [], f"{type(exc).__name__}: {exc}"
 
 
+def record_and_transcribe(seconds, device: str, options: dict) -> tuple[object, str, str]:
+    """Record one clip and transcribe it — on a worker thread, never raising.
+
+    录音 + 上传识别都要花时间（录 5 秒就是 5 秒），**绝不能放在 UI 线程**；
+    而工作线程里抛异常只会静默杀死线程、让 `_mic_busy` 永远卡住，所以这里把一切
+    都变成 ``(clip, text, error)`` 三段交回主线程。
+
+    Args:
+        seconds: Recorded duration.
+        device: Device name substring.
+        options: ``asr`` config block (``base_url`` / ``model`` / ``api_key``).
+
+    Returns:
+        ``(clip, text, error)`` — exactly one of text/error carries a value.
+    """
+    try:
+        clip = microphone.record(seconds, device)
+    except Exception as exc:  # noqa: BLE001 - 后台线程必须自己兜住一切
+        return microphone.Clip(error=f"{type(exc).__name__}: {exc}"), "", ""
+    if clip.error:
+        return clip, "", clip.error
+    if not microphone.is_audible(clip.rms):
+        return clip, "", f"这句太轻了（音量 {clip.rms:.0f}），没听到你说什么"
+    try:
+        text, error = transcribe_clip(clip.path, options)
+    except Exception as exc:  # noqa: BLE001 - 兜底，理论上 transcribe_clip 不抛
+        return clip, "", f"{type(exc).__name__}: {exc}"
+    return clip, text, error
+
+
+def local_models_ready() -> bool:
+    """Are both local models (recognizer + silence detector) on disk?
+
+    Returns:
+        True when neither download is needed.
+    """
+    try:
+        import local_asr  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - 模块缺失即视为没装好
+        return False
+    return local_asr.is_ready() and listening.is_ready()
+
+
+def local_model_summary() -> str:
+    """One line describing what local models are installed.
+
+    Returns:
+        Chinese summary.
+    """
+    parts = []
+    try:
+        import local_asr  # noqa: PLC0415
+
+        parts.append(local_asr.describe())
+    except Exception:  # noqa: BLE001
+        parts.append("本机识别：模块不可用")
+    parts.append(listening.describe())
+    return "；".join(parts)
+
+
+def listening_drop(path: str) -> None:
+    """Delete one segment wav (kept tiny so callers read clearly).
+
+    Args:
+        path: File to remove.
+    """
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def transcribe_clip(path: str, options: dict) -> tuple[str, str]:
+    """Transcribe an existing wav on a worker thread, never raising.
+
+    Args:
+        path: Wav file to recognize.
+        options: The ``asr`` config block.
+
+    Returns:
+        ``(text, error)`` — one of them is always empty.
+    """
+    try:
+        return asr.transcribe_with(path, options), ""
+    except ASRError as exc:
+        return "", str(exc)
+    except Exception as exc:  # noqa: BLE001 - 后台线程必须自己兜住一切
+        return "", f"{type(exc).__name__}: {exc}"
+
+
+def fetch_model(progress=None) -> tuple[str, str]:  # noqa: ANN001 - 可选回调
+    """Download the local models (recognizer + silence detector) on a worker thread.
+
+    Args:
+        progress: Optional ``callable(done, total)`` forwarded to the downloader.
+
+    Returns:
+        ``(message, error)`` — one of them is always empty.
+    """
+    messages: list[str] = []
+    try:
+        import local_asr  # noqa: PLC0415 - 只在真的要下模型时才需要它
+
+        messages.append(local_asr.fetch(progress=progress))
+    except Exception as exc:  # noqa: BLE001 - 后台线程必须自己兜住
+        return "", f"识别模型没下成：{exc}"
+    try:
+        messages.append(listening.fetch_vad(progress=progress))
+    except Exception as exc:  # noqa: BLE001 - 同上
+        return "", f"识别模型好了，但静音检测模型没下成：{exc}"
+    return "；".join(messages), ""
+
+
 DEFAULT_CONFIG = {
     # -1 表示"第一次运行时放到右下角"
     "x": -1,
@@ -166,6 +297,29 @@ DEFAULT_CONFIG = {
     "weather_place": "",
     "weather_lat": 0.0,
     "weather_lon": 0.0,
+    # 麦克风（P3-b「听懂」）：默认**关**——麦克风比摄像头更敏感，得你显式打开。
+    # 打开后也只在**你点菜单**时录一句（没有常驻监听），锁屏时不录，录完的 wav 交出去就删。
+    "mic_listen": False,
+    "mic_seconds": 5.0,
+    "mic_device": "",
+    "mic_keep_clip": False,
+    # 对话模式（P4-b）：麦克风常开、由静音检测自动断句，说完就接话。
+    # 默认关；只在"对话模式"里工作；锁屏不听；她说话/思考时不听（防自激）；
+    # 一段时间没交互自动退出。`voice` 是"她出声"的开关，**本轮先不做**，只留位。
+    "conversation": False,
+    "vad_silence_ms": 700,
+    "vad_min_speech_ms": 250,
+    "conversation_idle_seconds": 180,
+    "voice": False,
+    # 语音转文字：默认走**本机**引擎（sherpa-onnx + 本地模型），声音不出这台机器。
+    # engine 改成 "openai" 就切回云端（OpenAI 兼容接口，音频会上传）；
+    # base_url/model/api_key 只在云端路线用；api_key 留空时会去读 AstrBot 那份 key。
+    "asr": {
+        "engine": "local",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-asr",
+        "api_key": "",
+    },
     # 独立版（分发给别人用）：local 自带大脑、填自己的 API Key；astrbot 连本机的 AstrBot
     "mode": "astrbot",
     "llm": {},
@@ -264,8 +418,24 @@ class PetWindow(QWidget):
         self._net = NetSignals()
         self._net.weather.connect(self.on_weather)
         self._net.place.connect(self.on_place)
+        self._net.heard.connect(self.on_heard)
+        self._net.model.connect(self.on_model)
+        self._net.model_progress.connect(self.on_model_progress)
+        self._net.transcribed.connect(self.on_transcribed)
         self._weather_busy = False
         self._geo_busy = False
+        self._mic_busy = False
+        self._mic_last = 0.0
+        self._model_busy = False
+        self._model_announced = 0.0
+        # 对话模式（P4）：常开麦克风 + 四态（待机/在听/在想/在说）
+        self._listener = None
+        self._thinking = False
+        self._conversation_deadline = 0.0
+        self._stream_text = ""
+        self._state_timer = QTimer(self)
+        self._state_timer.timeout.connect(self.check_conversation)
+        self._state_timer.start(15_000)
         self._build_menu()
         self._build_tray()
         # 启动就连上桌面通道：她要能随时把消息弹到桌面上（不只是你打开聊天窗时）
@@ -386,6 +556,25 @@ class PetWindow(QWidget):
         act_place = QAction("设置位置…", self)
         act_place.setToolTip("填城市名（例：北京市）；我用它查经纬度存到本机，不会拿 IP 猜")
         act_place.triggered.connect(self.set_location)
+        act_hear = QAction("听一句（5 秒）", self)
+        act_hear.setToolTip("录一句话转成文字发给她；只有你点这里才会开麦，录完就删")
+        act_hear.triggered.connect(self.hear_once)
+        self.act_mic_on = QAction("允许麦克风", self, checkable=True)
+        self.act_mic_on.setToolTip("默认关。关着时连录都不会录；开着也只在你说「听一句」时录")
+        self.act_mic_on.setChecked(bool(self.config.get("mic_listen", False)))
+        self.act_mic_on.triggered.connect(self.toggle_mic)
+        act_asr_key = QAction("语音识别 Key…", self)
+        act_asr_key.setToolTip("只在 asr.engine=openai（云端）时用；本机引擎不需要 Key")
+        act_asr_key.triggered.connect(self.set_asr_key)
+        act_model = QAction("下载本机模型…", self)
+        act_model.setToolTip("本机识别用的中文模型（78 MB）+ 静音检测模型（0.6 MB），只下一次")
+        act_model.triggered.connect(self.download_asr_model)
+        self.act_conversation = QAction("对话模式（不用点，直接说）", self, checkable=True)
+        self.act_conversation.setToolTip(
+            "开着时麦克风常开、由静音检测自动断句；锁屏不听、超时自动退出、随时可关"
+        )
+        self.act_conversation.setChecked(bool(self.config.get("conversation", False)))
+        self.act_conversation.triggered.connect(self.toggle_conversation)
         act_setup = QAction("设置 API Key…", self)
         act_setup.triggered.connect(self.open_setup)
         act_link = QAction("重连 AstrBot", self)
@@ -400,6 +589,11 @@ class PetWindow(QWidget):
         menu.addAction(self.act_jpeg)
         menu.addAction(act_weather)
         menu.addAction(act_place)
+        menu.addAction(act_hear)
+        menu.addAction(self.act_mic_on)
+        menu.addAction(self.act_conversation)
+        menu.addAction(act_asr_key)
+        menu.addAction(act_model)
         menu.addAction(act_line)
         menu.addAction(act_chat)
         menu.addAction(act_link)
@@ -693,6 +887,7 @@ class PetWindow(QWidget):
             self._brain = client
             self._link_ok = True
             client.done.connect(self._on_chat_reply)
+            client.chunk.connect(self.on_chat_chunk)
             client.failed.connect(self._on_link_problem)
             client.start()
             if not (self.config.get("llm") or {}).get("api_key"):
@@ -715,6 +910,7 @@ class PetWindow(QWidget):
             )
             client.ready.connect(self._remember_session)
         client.done.connect(self._on_chat_reply)
+        client.chunk.connect(self.on_chat_chunk)
         client.start()
         return client
 
@@ -889,6 +1085,365 @@ class PetWindow(QWidget):
         note("天气 " + result.summary().replace("\n", "　"))
         self.say(result.describe(), 15000)
 
+    def download_asr_model(self) -> None:
+        """Fetch the local recognition model (menu 「下载识别模型…」）."""
+        if self._model_busy:
+            self.say("模型还在下呢，下完我会说一声~", 5000)
+            return
+        if local_models_ready():
+            self.say(local_model_summary(), 12000)
+            return
+        self._model_busy = True
+        self._model_announced = 0.0
+        self.say("开始下本机模型（识别 78 MB + 静音检测 0.6 MB，只下一次）…", 6000)
+        note("开始下载本机模型（识别 + 静音检测）")
+        threading.Thread(
+            target=lambda: self._net.model.emit(
+                *fetch_model(progress=lambda done, total: self._net.model_progress.emit(done, total))
+            ),
+            name="pet-model",
+            daemon=True,
+        ).start()
+
+    def on_model_progress(self, done: int, total: int) -> None:
+        """Show download progress at most every 5% (runs on the UI thread).
+
+        Args:
+            done: Bytes downloaded.
+            total: Expected bytes (0 when the server did not say).
+        """
+        if not total:
+            return
+        share = done / total
+        if share - self._model_announced >= 0.05:
+            self._model_announced = share
+            self.say(f"模型下载 {share * 100:.0f}%（{done / 1024 / 1024:.0f} MB）", 4000)
+
+    def on_model(self, text: str, error: str) -> None:
+        """Report the finished model download (runs on the UI thread).
+
+        Args:
+            text: Success line.
+            error: Failure line.
+        """
+        self._model_busy = False
+        if error:
+            note(f"下载识别模型失败：{error}")
+            self.say(error, 15000)
+            return
+        note(f"识别模型就绪：{text}")
+        self.say(text, 12000)
+
+    # ------------------------------------------------------------ 对话模式（P4）
+
+    def state_text(self) -> str:
+        """Human-readable pet state, for the tray tooltip.
+
+        Returns:
+            One of 待机 / 在听 / 在想 / 在说.
+        """
+        if time.time() < getattr(self, "_speaking_until", 0.0):
+            return "在说"
+        if self._thinking:
+            return "在想"
+        if self._listening_now():
+            return "在听"
+        return "待机"
+
+    def _conversation_on(self) -> bool:
+        """Is conversation mode switched on?
+
+        Returns:
+            The configuration flag.
+        """
+        return bool(self.config.get("conversation", False))
+
+    def _listening_now(self) -> bool:
+        """Is the microphone actually open for conversation mode?
+
+        Returns:
+            True while the VAD listener is capturing.
+        """
+        return bool(self._listener is not None and self._listener.is_running())
+
+    def toggle_conversation(self, checked: bool) -> None:
+        """Turn conversation mode on/off (menu 「对话模式」）.
+
+        Args:
+            checked: New state from the menu item.
+        """
+        self.config["conversation"] = bool(checked)
+        save_config(self.config)
+        if checked:
+            self._conversation_touch()
+            self._start_listening()
+        else:
+            self._stop_listening()
+            self.say("好，对话模式关了，麦克风也关了。", 6000)
+        note(f"对话模式 {'开' if checked else '关'}")
+
+    def _start_listening(self) -> None:
+        """Open the microphone if every gate allows it."""
+        if self._listener is None:
+            self._listener = listening.Listener(
+                silence_ms=listening.normalize_ms(
+                    self.config.get("vad_silence_ms"), listening.DEFAULT_SILENCE_MS
+                ),
+                min_speech_ms=listening.normalize_ms(
+                    self.config.get("vad_min_speech_ms"), listening.DEFAULT_MIN_SPEECH_MS
+                ),
+            )
+            self._listener.utterance.connect(self.on_utterance)
+            self._listener.failed.connect(self.on_listen_failed)
+        readings = pc_state.name_of(pc_state.read_state())
+        allowed, reason = listening.should_listen(
+            conversation=self._conversation_on(),
+            locked=readings.get("locked"),
+            thinking=self._thinking,
+            speaking=time.time() < getattr(self, "_speaking_until", 0.0),
+            has_device=bool(microphone.devices()),
+            already_running=self._listening_now(),
+        )
+        if not allowed:
+            if reason and reason != "已经在听了":
+                self.say(f"先不听：{reason}", 6000)
+            return
+        if self._listener.start():
+            self._conversation_touch()
+            minutes = max(1, int(self._idle_seconds() // 60))
+            self.say(
+                f"对话模式开着呢——直接说话就行，你停顿一下我就接。"
+                f"{minutes} 分钟没动静我会自己退出。",
+                9000,
+            )
+            note(f"开始连续听（静音 {self._listener.silence_ms:.0f}ms 判停）")
+
+    def _stop_listening(self) -> None:
+        """Close the microphone (used when pausing, exiting, or locking)."""
+        if self._listener is None:
+            return
+        was = self._listener.is_running()
+        self._listener.stop()
+        if was:
+            note("停止连续听")
+
+    def _resume_after_reply(self) -> None:
+        """Continue conversation mode if the user still wants it."""
+        if self._conversation_on():
+            self._conversation_touch()
+            self._start_listening()
+
+    def _idle_seconds(self) -> float:
+        """Configured auto-exit window, clamped to something sane.
+
+        Returns:
+            Seconds between 30 and 3600.
+        """
+        try:
+            value = float(self.config.get("conversation_idle_seconds") or 180)
+        except (TypeError, ValueError):
+            return 180.0
+        return min(3600.0, max(30.0, value))
+
+    def _conversation_touch(self) -> None:
+        """Refresh the "still talking" deadline."""
+        self._conversation_deadline = time.time() + self._idle_seconds()
+
+    def check_conversation(self) -> None:
+        """Auto-exit after a quiet spell, and pause while the screen is locked.
+
+        这个定时器就是"你走了它还开着麦"的解药：超过设定时间没听到任何一句，
+        自动退回点击式并告诉你一声；锁屏则立刻暂停（人不在就不该收音）。
+        """
+        if not self._conversation_on():
+            return
+        readings = pc_state.name_of(pc_state.read_state())
+        if readings.get("locked") is True:
+            if self._listening_now():
+                self._stop_listening()
+                self.say("你锁屏了，我先不听。", 5000)
+                note("锁屏 -> 暂停连续听")
+            return
+        if time.time() >= getattr(self, "_conversation_deadline", 0.0):
+            self.config["conversation"] = False
+            save_config(self.config)
+            if getattr(self, "act_conversation", None) is not None:
+                self.act_conversation.setChecked(False)
+            self._stop_listening()
+            self.say("有一会儿没说话了，我先退出对话模式（想聊再点一下）。", 9000)
+            note("对话模式超时自动退出")
+
+    def on_utterance(self, utterance) -> None:  # noqa: ANN001 - listening.Utterance
+        """Handle one finished sentence: recognize it, then hand it to her.
+
+        Args:
+            utterance: The segment the VAD just closed.
+        """
+        if self._thinking:
+            # 已经在等她的回复了：这一句丢掉，免得排队堆成好几问
+            listening_drop(utterance.path)
+            return
+        self._conversation_touch()
+        self._stop_listening()  # 想/说期间不听：既防自激，也避免一句话被切成两半
+        self._thinking = True
+        self.say(f"听到了（{utterance.seconds:.1f} 秒），我听听是什么…", 3500)
+        options = dict(self.config.get("asr") or {})
+        threading.Thread(
+            target=lambda: self._net.transcribed.emit(
+                utterance.path, *transcribe_clip(utterance.path, options)
+            ),
+            name="pet-talk-asr",
+            daemon=True,
+        ).start()
+
+    def on_transcribed(self, path: str, text: str, error: str) -> None:
+        """Send a recognized sentence to her (runs on the UI thread).
+
+        Args:
+            path: The wav that was recognized.
+            text: Transcript, empty on failure.
+            error: Failure text, empty on success.
+        """
+        if path and not bool(self.config.get("mic_keep_clip", False)):
+            listening_drop(path)
+        if error or not text:
+            self._thinking = False
+            note(f"对话模式识别失败：{error or '（空）'}")
+            self.say(error or "没听出文字，再说一次？", 8000)
+            self._resume_after_reply()
+            return
+        note(f"对话模式听成：{text}")
+        self.say(f"你：「{text}」", 2500)
+        self._stream_text = ""
+        client = self._client or self._make_client()
+        client.send(text)
+
+    def on_chat_chunk(self, text: str) -> None:
+        """Show her answer while it is still being generated (streaming bubble).
+
+        Args:
+            text: One streamed fragment.
+        """
+        if not text:
+            return
+        self._stream_text = (getattr(self, "_stream_text", "") + text)[-400:]
+        anchor = QPoint(self.x() + self.width() // 2, self.y() + 8)
+        self.bubble.show_text(self._stream_text + "▌", anchor, 20000)
+
+    def on_listen_failed(self, message: str) -> None:
+        """Report a listener problem and stop pretending we are listening.
+
+        Args:
+            message: Failure text.
+        """
+        note(f"连续听失败：{message}")
+        self.say(message, 12000)
+        self._stop_listening()
+
+    def set_asr_key(self) -> None:
+        """Store a speech-to-text key (menu 「语音识别 Key…」)."""
+        current = str((self.config.get("asr") or {}).get("api_key") or "")
+        text, ok = QInputDialog.getText(
+            self,
+            "语音识别 Key",
+            "留空 = 用 AstrBot 里已经配好的那家；\n填了就优先用你填的（只存本机 config.json）",
+            QLineEdit.Password,
+            current,
+        )
+        if not ok:
+            return
+        block = dict(self.config.get("asr") or {})
+        block["api_key"] = str(text or "").strip()
+        self.config["asr"] = block
+        save_config(self.config)
+        note("语音识别 Key " + ("已更新" if block["api_key"] else "已清空（改用 AstrBot 里的）"))
+        self.say("记下了~" if block["api_key"] else "好，改用 AstrBot 里的那份 Key。", 5000)
+
+    def toggle_mic(self, checked: bool) -> None:
+        """Remember whether the microphone feature is allowed.
+
+        Args:
+            checked: New state from the menu item.
+        """
+        self.config["mic_listen"] = bool(checked)
+        save_config(self.config)
+        self.say(
+            "麦克风开了——但只在你点「听一句」时才会录，录完就删~"
+            if checked
+            else "好，麦克风关了，我不会再录。",
+            6000,
+        )
+
+    def hear_once(self) -> None:
+        """Record one sentence, transcribe it, and hand it to her (menu 「听一句」).
+
+        和"看屏幕/看一眼"完全同构：**只有你点这一下才会开麦**，没有常驻监听；
+        锁屏时不录（你人不在，不该开麦）；录到的 wav 发完就删（除非开了 `mic_keep_clip`）。
+        """
+        if not self.config.get("mic_listen", False):
+            self.say("麦克风关着呢——右键点「允许麦克风」我才会听。", 7000)
+            return
+        if self._mic_busy:
+            self.say("上一条还在识别呢~", 4000)
+            return
+        now = time.time()
+        if now - self._mic_last < microphone.COOLDOWN_SECONDS:
+            self.say("刚录过一句，缓一下~", 4000)
+            return
+        readings = pc_state.name_of(pc_state.read_state())
+        if readings.get("locked") is True:
+            # 锁屏＝人不在。这里刻意**不录**，而不是"录了但不说"
+            self.say("你锁屏了吧？我先不录。", 6000)
+            return
+        if not microphone.devices():
+            self.say("没找到麦克风（QtMultimedia 没拿到设备）。", 8000)
+            return
+        options = dict(self.config.get("asr") or {})
+        if str(options.get("engine") or "local").lower() == "local":
+            # 先检查模型，别录完 5 秒才发现没模型——那时候你话已经说完了
+            try:
+                import local_asr  # noqa: PLC0415
+
+                if not local_asr.is_ready():
+                    self.say("本机还没下识别模型——右键点「下载识别模型…」（约 78 MB）。", 12000)
+                    return
+            except Exception as exc:  # noqa: BLE001 - 模块缺失
+                self.say(f"本机识别模块不可用：{type(exc).__name__}", 9000)
+                return
+        seconds = microphone.normalize_seconds(self.config.get("mic_seconds"))
+        self._mic_busy = True
+        self._mic_last = now
+        self.say(f"听着呢…（{seconds:.0f} 秒）", 4000)
+        device = str(self.config.get("mic_device") or "")
+        threading.Thread(
+            target=lambda: self._net.heard.emit(
+                *record_and_transcribe(seconds, device, options)
+            ),
+            name="pet-hear",
+            daemon=True,
+        ).start()
+
+    def on_heard(self, clip, text: str, error: str) -> None:  # noqa: ANN001 - microphone.Clip
+        """Deliver a finished transcription (runs on the UI thread).
+
+        Args:
+            clip: The recording (may carry its own error).
+            text: Transcript, empty on failure.
+            error: Failure message, empty on success.
+        """
+        self._mic_busy = False
+        keep = bool(self.config.get("mic_keep_clip", False))
+        if clip.path and not keep:
+            microphone.drop(clip.path)
+        if error:
+            note(f"听一句失败：{error}（{clip.describe()}）")
+            self.say(error, 10000)
+            return
+        note(f"听成：{text}（{clip.describe()}）")
+        self.say(f"你说的：「{text}」", 6000)
+        client = self._client or self._make_client()
+        client.send(text)
+
     def set_location(self) -> None:
         """Ask for a city name and store the coordinates it resolves to (menu 「设置位置…」）。"""
         if self._geo_busy:
@@ -1053,7 +1608,11 @@ class PetWindow(QWidget):
         if not text:
             return
         self._speaking_until = time.time() + 2.5
+        self._stream_text = ""
+        self._thinking = False
         self.say(text, SPEAK_BUBBLE_MS)
+        # 她的回复到齐了：对话模式继续听下一句
+        self._resume_after_reply()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
         """Start a drag or remember a click.

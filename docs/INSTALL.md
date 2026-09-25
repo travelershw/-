@@ -66,6 +66,40 @@ python build_exe.py
 | 今天天气 | 天气 / 空气质量 / 日出日落 | 走 [Open-Meteo](https://open-meteo.com/)（**免 API Key、免注册**），只读 GET |
 | 设置位置… | 填城市名 | 用它查一次经纬度，**存到本机 `config.json`**（`weather_place` / `weather_lat` / `weather_lon`）。**不会用 IP 反查你的位置**；不填就没法查天气（只会提示你去设） |
 
+### 6. 语音：听你说、以及"对话模式"
+
+桌宠可以听你说话，**默认全部关闭**，要你显式打开：
+
+| 菜单项 | 作用 |
+| --- | --- |
+| 听一句（5 秒） | 录一句、本机转成文字发给她（点一次录一次） |
+| 允许麦克风 | 麦克风总开关（关掉后连"听一句"都不录） |
+| 对话模式（不用点，直接说） | **麦克风常开**，由静音检测判断你说完没有，说完就接话 |
+| 语音识别 Key… | 只在用云端识别（`asr.engine = "openai"`）时才需要 |
+| 下载本机模型… | 下识别模型（78 MB）+ 静音检测模型（0.6 MB），**只下一次** |
+
+**本机识别怎么装**（默认路线，音频不出本机）：
+
+```powershell
+# 1) 装引擎（纯 CPU，无需 GPU / torch）
+cd desktop
+.\.venv\Scripts\python.exe -m pip install sherpa-onnx
+
+# 2) 下模型：直接右键桌宠 →「下载本机模型…」即可；
+#    也可以手动放成下面这个结构（模型来自 k2-fsa/sherpa-onnx 官方发布）：
+#      desktop/models/asr/sherpa-onnx-paraformer-zh-small-2024-03-09/model.int8.onnx
+#      desktop/models/asr/sherpa-onnx-paraformer-zh-small-2024-03-09/tokens.txt
+#      desktop/models/vad/silero_vad.onnx
+```
+
+- 下载会**依次尝试 hf-mirror → huggingface → GitHub**（国内网络下通常只有镜像能跑通），
+  并且**校验字节数**：下不完整会删掉重来，不会把半个模型当成好模型；
+- 实测：5 秒语音识别约 **0.08 秒**（纯 CPU，比实时快几十倍）；
+- 「对话模式」的安全阀：**默认关**、**锁屏自动暂停**、**她说话/思考时自动闭麦**（防自激）、
+  连续 3 分钟没说话**自动退出**；
+- 想改用云端识别（会**上传音频**）：把 `config.json` 里 `asr.engine` 改成 `"openai"`，
+  填 `base_url` / `model` / `api_key` 即可（任何 OpenAI 兼容的 `/audio/transcriptions` 都能用）。
+
 > **中文城市名的小坑（实测）**：直接在「设置位置…」里填「开封」这类名字，地图服务
 > 可能先返回**同名的小村庄**（人口为空，甚至不在同一个省）。桌宠只认"有真实人口"的结果，
 > 找不到就让你换个说法，**不会把你定位到别的省**；遇到查不到时加个「市」再试（例如「开封市」）
@@ -84,6 +118,8 @@ python build_exe.py
 | `shot_format` | 截图格式：`png`（默认）或 `jpeg`；也可用右键菜单切换 |
 | `camera_keep_frame` | 默认 `false`＝摄像头那一帧发送后删除；改成 `true` 会留在 `shots/` 里 |
 | `weather_place` / `weather_lat` / `weather_lon` | 天气的位置。**默认是空的**，用右键菜单「设置位置…」填一次即可 |
+| `mic_listen` / `conversation` | 麦克风总开关与"对话模式"。**默认都是 false**，不点就不录；对话模式下还会锁屏暂停、她说话时闭麦、超时自动退出 |
+| `asr.engine` | `"local"`（默认，本机识别、音频不出机器）或 `"openai"`（云端，会**上传音频**） |
 
 > ⚠️ **改 `config.json` 前先退出桌宠**：桌宠在正常退出时会用内存里的设置**整体重写**
 > `config.json`，边跑边改会被覆盖掉。

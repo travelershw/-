@@ -1,9 +1,35 @@
 {
+  "_说明": "桌宠配置示例。复制成 config.json 再改；**不要**把填了 Key 的 config.json 发给别人。",
+  "_说明_模式": "mode=local 用你自己的 Key 直连大模型；mode=astrbot 连本机 AstrBot（记忆/好感与 QQ 打通）。",
   "mode": "local",
   "llm": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key": ""},
   "vision": {"mode": "caption", "base_url": "", "model": "", "api_key": ""},
   "desktop_url": "ws://127.0.0.1:6198",
   "desktop_secret": "",
   "chat_transport": "desktop",
-  "screen_capture": true
+  "screen_capture": true,
+  "shot_format": "png",
+  "pc_state": true,
+  "camera_capture": true,
+  "camera_propose": true,
+  "camera_keep_frame": false,
+  "weather": true,
+  "weather_place": "",
+  "weather_lat": 0.0,
+  "weather_lon": 0.0,
+  "mic_listen": false,
+  "mic_seconds": 5.0,
+  "mic_device": "",
+  "mic_keep_clip": false,
+  "conversation": false,
+  "vad_silence_ms": 700,
+  "vad_min_speech_ms": 250,
+  "conversation_idle_seconds": 180,
+  "voice": false,
+  "asr": {
+    "engine": "local",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-asr",
+    "api_key": ""
+  }
 }

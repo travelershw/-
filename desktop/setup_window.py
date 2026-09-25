@@ -76,7 +76,10 @@ class SetupDialog(QDialog):
 
         self.mode = QComboBox(self)
         self.mode.addItems([MODE_LOCAL, MODE_OWN, MODE_REMOTE])
-        self.mode.currentTextChanged.connect(self._sync)
+        # 注意：**不要**在这里就 connect `_sync`。下面 `setCurrentText` 会立刻触发它，
+        # 而那时 `self.llm_box` 还没建出来——实测在"连 AstrBot"模式打开设置直接崩：
+        #   AttributeError: 'SetupDialog' object has no attribute 'llm_box'
+        # 信号的连接放到所有控件建好之后（见本函数末尾），初始状态由那次显式 `_sync` 负责。
         if str(config.get("mode")) == "astrbot":
             url = str(config.get("desktop_url") or "")
             self.mode.setCurrentText(
@@ -159,6 +162,8 @@ class SetupDialog(QDialog):
 
         self._guess_preset(llm.get("base_url", ""))
         self._sync(self.mode.currentText())
+        # 控件齐了再连：这样切换"运行方式"能实时联动，而构造期间不会提前触发
+        self.mode.currentTextChanged.connect(self._sync)
         self._test_result.connect(self._on_test_result)
 
     # ---------------------------------------------------------------- 交互
