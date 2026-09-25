@@ -175,7 +175,7 @@ class NetSignals(QObject):
     heard = Signal(object, str, str)  # (microphone.Clip, 转写文字, 错误文本)
     model = Signal(str, str)  # (下载结果文本, 错误文本)
     model_progress = Signal(int, int)  # 已下字节, 总字节
-    transcribed = Signal(str, str, str)  # (wav 路径, 文字, 错误文本) —— 对话模式专用
+    transcribed = Signal(str, str, str, bool)  # (wav 路径, 文字, 错误文本, 是不是"插话")
 
 
 def fetch_weather(lat: float, lon: float, place: str):  # noqa: ANN202 - weather.Weather
@@ -1271,8 +1271,15 @@ class PetWindow(QWidget):
             self.say("好，对话模式关了，麦克风也关了。", 6000)
         note(f"对话模式 {'开' if checked else '关'}")
 
-    def _start_listening(self) -> None:
-        """Open the microphone if every gate allows it."""
+    def _start_listening(self, force: bool = False) -> None:
+        """Open the microphone if every gate allows it.
+
+        Args:
+            force: 恢复路径用（她刚说完、或看门狗发现麦关着）：忽略"她正在想/正在说"这两个
+                闸门。它们本来是为**防自激**（她出声时别把自己录回来），而她现在不出声，
+                拿来挡恢复只会让麦克风永远开不起来——"只对第一句有反应"的另一半原因。
+                其余闸门（对话模式、麦克风总开关、锁屏、有没有设备）仍然照旧生效。
+        """
         if self._listener is None:
             self._listener = listening.Listener(
                 silence_ms=listening.normalize_ms(
@@ -1288,8 +1295,8 @@ class PetWindow(QWidget):
         allowed, reason = listening.should_listen(
             conversation=self._conversation_on(),
             locked=readings.get("locked"),
-            thinking=self._thinking,
-            speaking=time.time() < getattr(self, "_speaking_until", 0.0),
+            thinking=False if force else self._thinking,
+            speaking=False if force else time.time() < getattr(self, "_speaking_until", 0.0),
             has_device=bool(microphone.devices()),
             already_running=self._listening_now(),
             mic_enabled=bool(self.config.get("mic_listen", False)),
@@ -1318,10 +1325,15 @@ class PetWindow(QWidget):
             note("停止连续听")
 
     def _resume_after_reply(self) -> None:
-        """Continue conversation mode if the user still wants it."""
-        if self._conversation_on():
-            self._conversation_touch()
-            self._start_listening()
+        """Continue conversation mode if the user still wants it.
+
+        `force=True`：`_speaking_until` 只是个"嘴还在动"的动画计时器，不该挡开麦
+        （它原来会让恢复失败，而失败之后**没有任何人重试**——这就是"只对第一句有反应"）。
+        """
+        if not self._conversation_on():
+            return
+        self._conversation_touch()
+        self._start_listening(force=True)
 
     def _idle_seconds(self) -> float:
         """Configured auto-exit window, clamped to something sane.
@@ -1378,6 +1390,12 @@ class PetWindow(QWidget):
             self._thinking = False
             if self._pending_speech:
                 self.flush_pending_speech()
+        # 看门狗：对话模式开着、人没锁屏、她也没在忙，但麦克风关着 → 一定是哪一步漏了，
+        # 自己捞回来（force：忽略"她正在想/说"这两个只该用于防自激的闸门）。
+        # **"只对第一句有反应"那种卡死就是靠这条兜住的**（原来没人重试）。
+        if not self._listening_now():
+            note("发现麦克风关着但对话模式开着，自动重新开麦")
+            self._start_listening(force=True)
 
     def on_utterance(self, utterance) -> None:  # noqa: ANN001 - listening.Utterance
         """Handle one finished sentence: recognize it, then hand it to her.
@@ -1391,35 +1409,42 @@ class PetWindow(QWidget):
         """
         self._conversation_touch()
         if self._thinking:
+            # 她在回答期间你说的话：转成文字后由 on_transcribed 排队（**不能在这里停麦**，
+            # 否则"抢话"根本收不到）。这里必须带 `queued=True`，否则 on_transcribed 会把
+            # 本回合自己的识别结果也当成插话排进队列——2026-09-25 就是这么"只对第一句有反应"的。
             threading.Thread(
                 target=lambda: self._net.transcribed.emit(
                     utterance.path,
                     *transcribe_clip(utterance.path, dict(self.config.get("asr") or {})),
+                    True,
                 ),
                 name="pet-talk-asr",
                 daemon=True,
             ).start()
             return
-        self._stop_listening()  # 想/说期间不停麦克风了：抢话要靠它
+        # 注意：**这里不要停麦**。想/说期间继续采集，是"你能打断她"的前提；
+        # 采集到的句子由上面的 _thinking 分支排队，不会丢。
         self._thinking = True
         self._thinking_since = time.time()
         self.say(random.choice(LISTEN_ACKS), 1200)
         options = dict(self.config.get("asr") or {})
         threading.Thread(
             target=lambda: self._net.transcribed.emit(
-                utterance.path, *transcribe_clip(utterance.path, options)
+                utterance.path, *transcribe_clip(utterance.path, options), False
             ),
             name="pet-talk-asr",
             daemon=True,
         ).start()
 
-    def on_transcribed(self, path: str, text: str, error: str) -> None:
+    def on_transcribed(self, path: str, text: str, error: str, queued: bool = False) -> None:
         """Send a recognized sentence to her (runs on the UI thread).
 
         Args:
             path: The wav that was recognized.
             text: Transcript, empty on failure.
             error: Failure text, empty on success.
+            queued: True when this sentence was spoken while she was answering
+                （那时才该排队；本回合自己的识别结果必须直接发出去）。
         """
         if path and not bool(self.config.get("mic_keep_clip", False)):
             listening_drop(path)
@@ -1433,8 +1458,12 @@ class PetWindow(QWidget):
             self.say(error or "没听出文字，再说一次？", 8000)
             self._resume_after_reply()
             return
-        if self._thinking:
-            # 她正在回答，你插了一句：先记下来，等这轮落地后合并发出去（不丢话）
+        if queued:
+            # 她正在回答，你插了一句：先记下来，等这轮落地后合并发出去（不丢话）。
+            # **只看 `queued`，不能再看 `_thinking`**：本回合自己的识别结果到达时
+            # `_thinking` 一定是 True（on_utterance 刚设的），拿它当判据会把第一句也排进队列、
+            # 永远发不出去——2026-09-25 的"只对第一句有反应"就是这么来的（我第一版只改了
+            # 一半，夹具当场又抓了一次）。
             self._pending_speech.append(text)
             del self._pending_speech[:-MAX_PENDING_SPEECH]
             note(f"她还在说，先把这句排起来（{len(self._pending_speech)} 句）：{text}")
