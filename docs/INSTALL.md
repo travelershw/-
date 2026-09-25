@@ -42,9 +42,11 @@ python build_exe.py
 
 `build_exe.py` 内部会用 `.venv` 里的 Python 调 PyInstaller，产物输出到 `_dist/`（单目录 + zip）。
 
-> **已知限制（诚实说明）**：`build_exe.py` 的 `EXCLUDES` 目前把 `PySide6.QtMultimedia` 排除了，
-> 所以**打包出来的 exe 用不了摄像头**（源码运行不受影响）。要 exe 也带摄像头，
-> 需要把该项从 `EXCLUDES` 里删掉再打包（体积会变大）。
+> **摄像头与打包**：`build_exe.py` 曾把 `PySide6.QtMultimedia` 排除在外，导致 exe 版点不动
+> 「用摄像头看一眼」。**现在已改为随包带上**（Qt6Multimedia + ffmpeg 后端 + Windows 媒体后端
+> 插件都在 `_internal` 里），代价是程序目录约 +21 MB（120.8 → 141.9 MB）、zip 约 +9 MB。
+> 如果你自己改动了 `EXCLUDES`，注意**不要把 `PySide6.QtMultimedia` 加回去**——
+> 源码运行不受影响，所以这个坑只在打包版才现形。
 
 ### 4. 桌宠说明
 
