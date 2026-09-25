@@ -1,16 +1,20 @@
-"""Offline tests for the camera rules: propose / capture limits and cleanup.
+"""Offline tests for the camera rules: propose / capture limits, cleanup, video-call bits.
 
-不碰真实摄像头：只测纯决策函数、结果对象与"用完即弃"的删除逻辑。
-"""
+不碰真实摄像头：只测纯决策函数、结果对象、图像换算与"用完即弃"的删除逻辑。
+（P5 的常开会话 `camera.Session` 需要真实设备，这里只验证它在没有设备时**优雅失败**。）"""
 
+import os
+import struct
 import sys
 import time
 import unittest
 from pathlib import Path
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import camera  # noqa: E402
+from PySide6.QtGui import QImage  # noqa: E402
 
 SCRATCH = Path(__file__).resolve().parent / "_camera_test"
 NOW = 1_800_000_000.0
@@ -193,6 +197,146 @@ class NoAutoCaptureTest(unittest.TestCase):
             camera.capture = original
         self.assertEqual(called, [])
         print("PASS test_proposal_does_not_capture")
+
+
+class PreviewSizeTest(unittest.TestCase):
+    """The preview window fits the frame into a small box, keeping the shape."""
+
+    def test_shrinks_landscape_and_portrait(self) -> None:
+        """Longest edge becomes the cap, aspect ratio preserved."""
+        self.assertEqual(camera.preview_size(1280, 720), (240, 135))
+        self.assertEqual(camera.preview_size(720, 1280), (135, 240))
+        print("PASS test_shrinks_landscape_and_portrait")
+
+    def test_small_frames_are_untouched(self) -> None:
+        """Already-small frames are not blown up."""
+        self.assertEqual(camera.preview_size(160, 120), (160, 120))
+        self.assertEqual(camera.preview_size(240, 240), (240, 240))
+        print("PASS test_small_frames_are_untouched")
+
+    def test_junk_never_returns_zero(self) -> None:
+        """Zero/negative sizes can't produce a 0x0 window."""
+        self.assertEqual(camera.preview_size(0, 0), (1, 1))
+        self.assertEqual(camera.preview_size(-5, 100), (1, 1))
+        print("PASS test_junk_never_returns_zero")
+
+
+def solid(value: int) -> QImage:
+    """Build a solid-grey image.
+
+    Args:
+        value: Grey level 0 … 255.
+
+    Returns:
+        The image.
+    """
+    image = QImage(64, 48, QImage.Format_RGB32)
+    image.fill(value)
+    return image
+
+
+class MotionTest(unittest.TestCase):
+    """Motion is what tells "有没有人在动" without uploading anything."""
+
+    def test_identical_is_zero(self) -> None:
+        """Two identical frames mean no motion."""
+        self.assertEqual(camera.motion_of(solid(120), solid(120)), 0.0)
+        print("PASS test_identical_is_zero")
+
+    def test_big_change_is_large(self) -> None:
+        """Black → white is a full-scale difference."""
+        self.assertAlmostEqual(camera.motion_of(solid(0), solid(255)), 1.0, places=2)
+        self.assertGreater(camera.motion_of(solid(0), solid(128)), 0.4)
+        print("PASS test_big_change_is_large")
+
+    def test_no_previous_frame(self) -> None:
+        """The first frame has nothing to compare against."""
+        self.assertEqual(camera.motion_of(None, solid(100)), 0.0)
+        self.assertEqual(camera.motion_of(solid(100), None), 0.0)
+        self.assertEqual(camera.motion_of(None, None), 0.0)
+        print("PASS test_no_previous_frame")
+
+
+class SaveFrameTest(unittest.TestCase):
+    """Frames written for sending follow the usual naming/size rules."""
+
+    def setUp(self) -> None:
+        """Point the module at a scratch shots directory."""
+        self.real = camera.SHOTS
+        camera.SHOTS = SCRATCH
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        """Restore and clean up."""
+        camera.SHOTS = self.real
+        for path in SCRATCH.glob("cam_*.jpg"):
+            path.unlink(missing_ok=True)
+        SCRATCH.rmdir()
+
+    def test_writes_and_shrinks(self) -> None:
+        """A huge frame is scaled down and saved as a readable JPEG."""
+        big = QImage(4000, 3000, QImage.Format_RGB32)
+        big.fill(90)
+        frame = camera.save_frame(big, "测试帧", brightness=90)
+        self.assertEqual(frame.error, "")
+        self.assertLessEqual(max(frame.width, frame.height), camera.MAX_LONG_EDGE)
+        self.assertIn("测试帧", frame.label)
+        self.assertGreater(frame.bytes, 0)
+        self.assertTrue(Path(frame.path).is_file())
+        self.assertTrue(Path(frame.path).name.startswith("cam_"))
+        print("PASS test_writes_and_shrinks")
+
+    def test_empty_input_is_reported(self) -> None:
+        """No image means an error, never a bogus file."""
+        self.assertTrue(camera.save_frame(None, "空").error)
+        self.assertTrue(camera.save_frame(QImage(), "空").error)
+        print("PASS test_empty_input_is_reported")
+
+
+class SessionTest(unittest.TestCase):
+    """The always-on session must fail loudly and harmlessly when it cannot open."""
+
+    def test_session_without_device_reports_failure(self) -> None:
+        """Either it opens, or it emits a failure and stays closed (never raises)."""
+        from PySide6.QtCore import QCoreApplication  # noqa: PLC0415
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        session = camera.Session()
+        problems: list[str] = []
+        session.failed.connect(problems.append)
+        opened = session.start()
+        if opened:
+            # 这台机器（或这个受限进程）真的能看到摄像头：验证常开会话的基本契约
+            self.assertTrue(session.is_open())
+            self.assertTrue(camera.devices())
+            session.stop()
+            self.assertFalse(session.is_open())
+            print("PASS test_session_without_device_reports_failure (真开起来了，走的是开着的分支)")
+        else:
+            self.assertTrue(problems, "失败时必须说清原因")
+            self.assertFalse(session.is_open())
+            self.assertIsNone(session.latest())
+            self.assertEqual(session.motion(), 0.0)
+            self.assertIn("摄像头", problems[0])
+            print(f"PASS test_session_without_device_reports_failure ({problems[0]})")
+        self.assertIsNotNone(app)
+
+    def test_snapshot_before_any_frame(self) -> None:
+        """Asking for a frame before one arrived is an error, not a crash."""
+        session = camera.Session()
+        frame = session.snapshot()
+        self.assertTrue(frame.error)
+        self.assertIn("还没有画面", frame.error)
+        print("PASS test_snapshot_before_any_frame")
+
+    def test_stop_is_idempotent(self) -> None:
+        """Closing an already-closed session is fine."""
+        session = camera.Session()
+        session.stop()
+        session.stop()
+        self.assertFalse(session.is_open())
+        self.assertEqual(session.frames_seen(), 0)
+        print("PASS test_stop_is_idempotent")
 
 
 if __name__ == "__main__":

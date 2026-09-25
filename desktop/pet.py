@@ -92,6 +92,69 @@ def install_crash_log() -> None:
     sys.excepthook = hook
 
 
+class PreviewWindow(QWidget):
+    """小预览窗：显示"她此刻能看到的画面"（就是你自己的摄像头画面）。
+
+    类似视频通话里那个自画面：不是必需，但没有它你不知道她到底看到了什么。
+    不抢焦点、不吃点击（点它也不会打断你在别的程序里的输入）。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowTransparentForInput
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._image = None
+        self._title = ""
+        self._last_paint = 0.0
+
+    def set_image(self, image, title: str = "") -> None:  # noqa: ANN001 - QImage
+        """Show one frame (throttled: repainting faster than ~10 fps is wasted work).
+
+        Args:
+            image: Frame to show.
+            title: Small caption under the picture.
+        """
+        self._image = image
+        self._title = title
+        now = time.monotonic()
+        if now - self._last_paint < 0.1:
+            return
+        self._last_paint = now
+        self._resize_to_image()
+        self.show()
+        self.raise_()
+        self.update()
+
+    def _resize_to_image(self) -> None:
+        """Fit the window to the frame plus room for the caption."""
+        if self._image is None:
+            return
+        width, height = self._image.width(), self._image.height()
+        self.resize(max(120, width), max(60, height + 18))
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Draw the frame with a thin border and a caption.
+
+        Args:
+            event: Paint event (unused).
+        """
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QBrush(QColor(24, 22, 28, 235)))
+        if self._image is not None:
+            painter.drawImage(0, 0, self._image)
+        if self._title:
+            painter.setPen(QColor(228, 224, 232))
+            painter.drawText(4, self.height() - 5, self._title)
+        painter.setPen(QColor(120, 112, 128))
+        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+
+
 class NetSignals(QObject):
     """把后台线程的网络结果送回 UI 线程。
 
@@ -311,6 +374,10 @@ DEFAULT_CONFIG = {
     "vad_min_speech_ms": 250,
     "conversation_idle_seconds": 180,
     "voice": False,
+    # 视频通话（P5）：摄像头常开、随时能"看到你"，但**只有说话时才把那一帧交出去**。
+    # 默认关；关掉立刻释放摄像头；预览小窗显示"她此刻能看到的画面"。
+    "video_call": False,
+    "video_preview": True,
     # 语音转文字：默认走**本机**引擎（sherpa-onnx + 本地模型），声音不出这台机器。
     # engine 改成 "openai" 就切回云端（OpenAI 兼容接口，音频会上传）；
     # base_url/model/api_key 只在云端路线用；api_key 留空时会去读 AstrBot 那份 key。
@@ -433,6 +500,9 @@ class PetWindow(QWidget):
         self._thinking = False
         self._conversation_deadline = 0.0
         self._stream_text = ""
+        # 视频通话（P5）：常开摄像头 + 预览小窗
+        self._video = None
+        self._preview = None
         self._state_timer = QTimer(self)
         self._state_timer.timeout.connect(self.check_conversation)
         self._state_timer.start(15_000)
@@ -575,6 +645,12 @@ class PetWindow(QWidget):
         )
         self.act_conversation.setChecked(bool(self.config.get("conversation", False)))
         self.act_conversation.triggered.connect(self.toggle_conversation)
+        self.act_video = QAction("视频通话（她能一直看到你）", self, checkable=True)
+        self.act_video.setToolTip(
+            "摄像头常开、你说完一句她就能看到当时的你；右上角小窗显示她看到什么。默认关。"
+        )
+        self.act_video.setChecked(bool(self.config.get("video_call", False)))
+        self.act_video.triggered.connect(self.toggle_video_call)
         act_setup = QAction("设置 API Key…", self)
         act_setup.triggered.connect(self.open_setup)
         act_link = QAction("重连 AstrBot", self)
@@ -592,6 +668,7 @@ class PetWindow(QWidget):
         menu.addAction(act_hear)
         menu.addAction(self.act_mic_on)
         menu.addAction(self.act_conversation)
+        menu.addAction(self.act_video)
         menu.addAction(act_asr_key)
         menu.addAction(act_model)
         menu.addAction(act_line)
@@ -1140,12 +1217,14 @@ class PetWindow(QWidget):
         """Human-readable pet state, for the tray tooltip.
 
         Returns:
-            One of 待机 / 在听 / 在想 / 在说.
+            One of 待机 / 在听 / 在看你 / 在想 / 在说.
         """
         if time.time() < getattr(self, "_speaking_until", 0.0):
             return "在说"
         if self._thinking:
             return "在想"
+        if self._video_on() and self._video is not None and self._video.is_open():
+            return "在看你"
         if self._listening_now():
             return "在听"
         return "待机"
@@ -1254,15 +1333,22 @@ class PetWindow(QWidget):
 
         这个定时器就是"你走了它还开着麦"的解药：超过设定时间没听到任何一句，
         自动退回点击式并告诉你一声；锁屏则立刻暂停（人不在就不该收音）。
+        摄像头同理：锁屏就把「视频通话」也停掉。
         """
-        if not self._conversation_on():
-            return
         readings = pc_state.name_of(pc_state.read_state())
         if readings.get("locked") is True:
+            if self._video_on() and self._video is not None and self._video.is_open():
+                self._stop_video()
+                self.say("你锁屏了，视频通话先停。", 5000)
+                note("锁屏 -> 暂停视频通话")
+            if not self._conversation_on():
+                return
             if self._listening_now():
                 self._stop_listening()
                 self.say("你锁屏了，我先不听。", 5000)
                 note("锁屏 -> 暂停连续听")
+            return
+        if not self._conversation_on():
             return
         if time.time() >= getattr(self, "_conversation_deadline", 0.0):
             self.config["conversation"] = False
@@ -1316,6 +1402,18 @@ class PetWindow(QWidget):
         self.say(f"你：「{text}」", 2500)
         self._stream_text = ""
         client = self._client or self._make_client()
+        # 视频通话开着：把**此刻**这一帧一起给她——这就是"她能看到你"的核心，
+        # 而不是每帧都上传（那样既费 token 也没意义）。
+        frame = self.live_frame()
+        if frame is not None:
+            note(f"视频通话随话附帧　{frame.describe()}")
+            client.send(text, frame.path)
+            if not bool(self.config.get("camera_keep_frame", False)):
+                QTimer.singleShot(
+                    camera.DELETE_AFTER_SECONDS * 1000,
+                    lambda path=frame.path: camera.drop(path),
+                )
+            return
         client.send(text)
 
     def on_chat_chunk(self, text: str) -> None:
@@ -1339,6 +1437,100 @@ class PetWindow(QWidget):
         note(f"连续听失败：{message}")
         self.say(message, 12000)
         self._stop_listening()
+
+    # ------------------------------------------------------------ 视频通话（P5）
+
+    def _video_on(self) -> bool:
+        """Is video call switched on?
+
+        Returns:
+            The configuration flag.
+        """
+        return bool(self.config.get("video_call", False))
+
+    def toggle_video_call(self, checked: bool) -> None:
+        """Open/close the always-on camera (menu 「视频通话」）.
+
+        Args:
+            checked: New state from the menu item.
+        """
+        self.config["video_call"] = bool(checked)
+        save_config(self.config)
+        if checked:
+            self._start_video()
+        else:
+            self._stop_video()
+            self.say("视频通话关了，摄像头也松开了。", 6000)
+        note(f"视频通话 {'开' if checked else '关'}")
+
+    def _start_video(self) -> None:
+        """Start the camera session and the preview window."""
+        if not self.config.get("camera_capture", True):
+            self.say("摄像头总开关关着呢（「允许摄像头」先勾上）。", 8000)
+            return
+        if self._video is None:
+            self._video = camera.Session(self)
+            self._video.failed.connect(self.on_video_failed)
+            self._video.updated.connect(self.on_video_frame)
+        if not camera.devices():
+            self.say("没找到摄像头。", 7000)
+            return
+        if not self._video.start():
+            return
+        if self.config.get("video_preview", True) and self._preview is None:
+            self._preview = PreviewWindow()
+            self._preview.move(self.x() - camera.PREVIEW_MAX_EDGE - 12, self.y())
+        self.say("视频通话开着——你说完一句我就能看到你（只有你这边开着）。", 9000)
+        note(f"视频通话开始（摄像头 {self._video.device_name()}）")
+
+    def _stop_video(self) -> None:
+        """Release the camera and close the preview."""
+        if self._preview is not None:
+            self._preview.hide()
+            self._preview = None
+        if self._video is not None and self._video.is_open():
+            self._video.stop()
+            note("视频通话停止（摄像头已释放）")
+
+    def on_video_frame(self) -> None:
+        """Paint the newest frame into the preview window."""
+        if self._preview is None or self._video is None:
+            return
+        image = self._video.latest()
+        if image is None:
+            return
+        width, height = camera.preview_size(image.width(), image.height())
+        self._preview.set_image(image.scaled(width, height), f"她看到的是这个　{self._video.device_name()}")
+        if self._preview.x() > self.x():  # 桌宠挪到左边时，预览也跟着换边
+            self._preview.move(max(0, self.x() - width - 12), self.y())
+
+    def on_video_failed(self, message: str) -> None:
+        """Report a camera problem and close the mode.
+
+        Args:
+            message: Failure text from the session.
+        """
+        note(f"视频通话失败：{message}")
+        self.say(message, 10000)
+        self.config["video_call"] = False
+        save_config(self.config)
+        if getattr(self, "act_video", None) is not None:
+            self.act_video.setChecked(False)
+        self._stop_video()
+
+    def live_frame(self) -> camera.Frame | None:
+        """The current frame, when video call is on and a picture exists.
+
+        Returns:
+            A saved frame ready to send, or None when video call is off/not ready.
+        """
+        if not self._video_on() or self._video is None or not self._video.is_open():
+            return None
+        frame = self._video.snapshot()
+        if frame.error:
+            note(f"取实时帧失败：{frame.error}")
+            return None
+        return frame
 
     def set_asr_key(self) -> None:
         """Store a speech-to-text key (menu 「语音识别 Key…」)."""
@@ -1442,6 +1634,17 @@ class PetWindow(QWidget):
         note(f"听成：{text}（{clip.describe()}）")
         self.say(f"你说的：「{text}」", 6000)
         client = self._client or self._make_client()
+        # 视频通话开着时，「听一句」也顺手把此刻那一帧带上（同一套规矩：发完就删）
+        frame = self.live_frame()
+        if frame is not None:
+            note(f"视频通话随话附帧　{frame.describe()}")
+            client.send(text, frame.path)
+            if not bool(self.config.get("camera_keep_frame", False)):
+                QTimer.singleShot(
+                    camera.DELETE_AFTER_SECONDS * 1000,
+                    lambda path=frame.path: camera.drop(path),
+                )
+            return
         client.send(text)
 
     def set_location(self) -> None:
