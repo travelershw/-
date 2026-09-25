@@ -1,4 +1,4 @@
 name: qingyu_affection
-desc: 轻语好感度系统：按说话语气在 0~100 间微调好感度，并按好感度切换回答语气（初始 60）
+desc: 轻语关系系统：好感 + 信任（伤害更快、修复更慢），按语气微调并按两者切换回答语气（初始各 60）
 author: migration
-version: 1.0.0
+version: 1.1.0

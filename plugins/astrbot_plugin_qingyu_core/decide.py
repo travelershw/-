@@ -34,6 +34,8 @@ W_NIGHT = -1.0
 W_IGNORED = -2.0
 # 好感加分的基准点：60 分在她的档位表里已经是"轻快亲近"，不该当中性值。
 AFFECTION_NEUTRAL = 50
+# 信任低于这个值时把语气压回去、不调侃（和关系插件里的 TRUST_GUARD 保持一致）。
+TRUST_GUARD = 45
 # 阈值。
 RESPOND_AT = 2.0
 # 评估"想不想插嘴"的门槛。校准史：0.6 → 1.5 → 2.0 + 分档静默 → **1.2（2026-09-17 测试值）**。
@@ -416,7 +418,13 @@ def decide(
 
 
 def _tone(snapshot: Snapshot) -> str:
-    """Pick a tone label from affection, mood and time.
+    """Pick a tone label from affection, trust, familiarity, mood and time.
+
+    三维一起看才算"真实"（2026-09-25）：
+
+    - **好感**决定基础亲近度（原来的行为）；
+    - **信任低**时把语气压回去（刚有过不愉快，不该还嬉皮笑脸）；
+    - **熟悉度高**时更随意（老熟人不用客套），熟悉度低时带上一点分寸。
 
     Args:
         snapshot: World state snapshot.
@@ -424,7 +432,8 @@ def _tone(snapshot: Snapshot) -> str:
     Returns:
         A short Chinese tone label.
     """
-    affection = snapshot.person.affection
+    person = snapshot.person
+    affection = person.affection
     if affection >= 80:
         base = "很亲昵"
     elif affection >= 60:
@@ -435,6 +444,14 @@ def _tone(snapshot: Snapshot) -> str:
         base = "客气疏远"
     else:
         base = "明显冷淡"
+    # 信任低：把语气压回"普通友好"以下，且不主动打趣（措辞交给注入的语气指令）。
+    if person.trust < TRUST_GUARD and affection >= 40:
+        base = "收着点、不调侃"
+    # 熟悉度：认识很久的人可以更随意，刚认识的人保留分寸。
+    if person.familiarity >= 200:
+        base += "、老熟人不客套"
+    elif person.familiarity < 5:
+        base += "、还不熟"
     if snapshot.mood.mood <= 35:
         base += "、有点蔫"
     elif snapshot.mood.mood >= 80:

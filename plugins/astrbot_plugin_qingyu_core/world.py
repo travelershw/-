@@ -15,6 +15,11 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from . import store
 
 AFFECTION_STORE = Path(get_astrbot_plugin_data_path()) / "qingyu_affection.json"
+# 关系插件没给出信任值时的兜底（和 Person.trust 的默认值保持一致）。
+# 注意：**不要**引用另一个插件里的常量——2026-09-25 我在这里写了 `INITIAL_TRUST`（它定义在
+# qingyu_affection 里），结果 `sync_affection` 在插件加载时抛 NameError，**整个 qingyu_core
+# 加载失败**。插件之间不走 import，常量必须各自定义。
+DEFAULT_TRUST = 60
 # 心情回落到中位的速度：每小时回落多少点。
 MOOD_DECAY_PER_HOUR = 6.0
 MOOD_MIN = 30
@@ -248,10 +253,10 @@ def remember_person(
 
 
 def sync_affection(connection) -> int:
-    """Mirror the affection plugin's JSON store into ``relations``.
+    """Mirror the relationship store into ``relations`` (affection + trust).
 
-    The affection plugin stays the writer for now (migration phase C moves it
-    here), so the core just reads that file and copies the numbers over.
+    读取路径已经改成现读（:func:`read_affection_store`），这里只做**入库镜像**，
+    方便统计与排障；`familiarity` 由本插件自己维护，**不在这里覆盖**。
 
     Args:
         connection: Open core database connection.
@@ -259,23 +264,28 @@ def sync_affection(connection) -> int:
     Returns:
         How many rows were updated.
     """
-    try:
-        data = json.loads(AFFECTION_STORE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return 0
-    if not isinstance(data, dict):
+    data = read_affection_store()
+    if not data:
         return 0
     stamp = store.now()
     changed = 0
-    for uid, value in data.items():
-        if not isinstance(value, int | float):
+    for uid, values in data.items():
+        affection = values.get("affection") if isinstance(values, dict) else values
+        if not isinstance(affection, int | float):
             continue
+        trust = values.get("trust") if isinstance(values, dict) else None
         cursor = connection.execute(
             "INSERT INTO relations (uid, affection, trust, familiarity, updated_at)"
-            " VALUES (?, ?, 60, 0, ?)"
+            " VALUES (?, ?, ?, 0, ?)"
             " ON CONFLICT(uid) DO UPDATE SET affection = excluded.affection,"
+            " trust = COALESCE(excluded.trust, relations.trust),"
             " updated_at = excluded.updated_at",
-            (str(uid), int(value), stamp),
+            (
+                str(uid),
+                int(affection),
+                int(trust) if isinstance(trust, int | float) else DEFAULT_TRUST,
+                stamp,
+            ),
         )
         changed += max(1, cursor.rowcount)
     connection.commit()
@@ -556,8 +566,59 @@ def load_mood(connection, group_id: str, ts: int | None = None) -> Mood:
     )
 
 
+_STORE_CACHE: dict = {"mtime": -1.0, "data": {}}
+
+
+def read_affection_store() -> dict:
+    """Read the relationship store written by ``qingyu_affection`` (mtime-cached).
+
+    为什么要**现读**而不是每 5 分钟同步一次：那个延迟会让"她刚被夸完，语气还是旧的"，
+    这是最不真实的一种表现（2026-09-25 从 `AFFECTION_SYNC_SECONDS = 300` 改成现读）。
+    文件很小，按 mtime 缓存，所以每条消息只多一次 `stat`。
+
+    Returns:
+        ``{uid: {"affection": int, "trust": int, ...}}``（空字典表示还没写过）。
+    """
+    try:
+        stamp = AFFECTION_STORE.stat().st_mtime
+    except OSError:
+        return {}
+    if stamp == _STORE_CACHE["mtime"]:
+        return _STORE_CACHE["data"]
+    raw = {}
+    try:
+        raw = json.loads(AFFECTION_STORE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    people: dict = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int | float):  # 旧格式：就是一个好感度分数
+                people[str(key)] = {"affection": int(value), "trust": None}
+            elif isinstance(value, dict):
+                people[str(key)] = {
+                    "affection": (
+                        int(value["affection"])
+                        if isinstance(value.get("affection"), int | float)
+                        else None
+                    ),
+                    "trust": (
+                        int(value["trust"])
+                        if isinstance(value.get("trust"), int | float)
+                        else None
+                    ),
+                }
+    _STORE_CACHE["mtime"], _STORE_CACHE["data"] = stamp, people
+    return people
+
+
 def load_person(connection, uid: str) -> Person:
     """Read one person together with their slow variables.
+
+    好感与信任**以关系插件的存储为准**（它是唯一写入方），现读、不吃同步延迟；
+    熟悉度仍由本插件维护（每条消息 +1）。
 
     Args:
         connection: Open core database connection.
@@ -583,6 +644,11 @@ def load_person(connection, uid: str) -> Person:
         person.affection = int(relation_row["affection"])
         person.trust = int(relation_row["trust"])
         person.familiarity = int(relation_row["familiarity"])
+    fresh = read_affection_store().get(str(uid)) or {}
+    if isinstance(fresh.get("affection"), int):
+        person.affection = fresh["affection"]
+    if isinstance(fresh.get("trust"), int):
+        person.trust = fresh["trust"]
     return person
 
 
