@@ -57,6 +57,13 @@ CHAR_HEIGHT = 250
 # 她"刚说过话"之后，气泡里那句话保留多久
 SPEAK_BUBBLE_MS = 9000
 MAX_LOG_LINES = 300
+# 你刚说完、她还没开口时，先冒一个极短的反应把空白填上（真人也会"嗯"一声）。
+# 只是"我在听"的语气词，**不表示懂了**——真正的回答随后到。
+LISTEN_ACKS = ("嗯——", "嗯？", "听着呢", "嗯嗯")
+# 她在回答期间你最多能插几句（排队，等她说完并成一轮发出去）
+MAX_PENDING_SPEECH = 3
+# 她那轮回复多久没回来就认为丢了（解开等待，免得排队的话发不出去）
+THINKING_TIMEOUT_SECONDS = 25.0
 
 
 def note(message: str) -> None:
@@ -370,7 +377,7 @@ DEFAULT_CONFIG = {
     # 默认关；只在"对话模式"里工作；锁屏不听；她说话/思考时不听（防自激）；
     # 一段时间没交互自动退出。`voice` 是"她出声"的开关，**本轮先不做**，只留位。
     "conversation": False,
-    "vad_silence_ms": 700,
+    "vad_silence_ms": 450,
     "vad_min_speech_ms": 250,
     "conversation_idle_seconds": 180,
     "voice": False,
@@ -503,6 +510,9 @@ class PetWindow(QWidget):
         # 视频通话（P5）：常开摄像头 + 预览小窗
         self._video = None
         self._preview = None
+        # P6：想/说期间你说的话不丢，先排队，等她这轮落地后合并成一条发出
+        self._pending_speech: list[str] = []
+        self._thinking_since = 0.0
         self._state_timer = QTimer(self)
         self._state_timer.timeout.connect(self.check_conversation)
         self._state_timer.start(15_000)
@@ -1359,21 +1369,41 @@ class PetWindow(QWidget):
             self._stop_listening()
             self.say("有一会儿没说话了，我先退出对话模式（想聊再点一下）。", 9000)
             note("对话模式超时自动退出")
+            return
+        # 安全阀：万一她那轮回复没回来（通道断了/被丢弃），别让 `_thinking` 永远卡住——
+        # 否则你说的话会一直只能排队，永远不会发出去。
+        stuck = self._thinking and time.time() - self._thinking_since > THINKING_TIMEOUT_SECONDS
+        if stuck:
+            note(f"她的回复超过 {THINKING_TIMEOUT_SECONDS:.0f} 秒没回来，解开等待")
+            self._thinking = False
+            if self._pending_speech:
+                self.flush_pending_speech()
 
     def on_utterance(self, utterance) -> None:  # noqa: ANN001 - listening.Utterance
         """Handle one finished sentence: recognize it, then hand it to her.
 
+        **她还在想/还在说的时候你说的话不再被丢掉**（2026-09-25 改）：以前这里直接
+        `drop`，于是"抢话"从体验上等于"你说的话被吃了"。现在先把它转成文字**排进待发队列**，
+        等她这一轮回复落地后**合并成一条**发出去——既不丢话，也不会同时开两个回合。
+
         Args:
             utterance: The segment the VAD just closed.
         """
-        if self._thinking:
-            # 已经在等她的回复了：这一句丢掉，免得排队堆成好几问
-            listening_drop(utterance.path)
-            return
         self._conversation_touch()
-        self._stop_listening()  # 想/说期间不听：既防自激，也避免一句话被切成两半
+        if self._thinking:
+            threading.Thread(
+                target=lambda: self._net.transcribed.emit(
+                    utterance.path,
+                    *transcribe_clip(utterance.path, dict(self.config.get("asr") or {})),
+                ),
+                name="pet-talk-asr",
+                daemon=True,
+            ).start()
+            return
+        self._stop_listening()  # 想/说期间不停麦克风了：抢话要靠它
         self._thinking = True
-        self.say(f"听到了（{utterance.seconds:.1f} 秒），我听听是什么…", 3500)
+        self._thinking_since = time.time()
+        self.say(random.choice(LISTEN_ACKS), 1200)
         options = dict(self.config.get("asr") or {})
         threading.Thread(
             target=lambda: self._net.transcribed.emit(
@@ -1394,12 +1424,25 @@ class PetWindow(QWidget):
         if path and not bool(self.config.get("mic_keep_clip", False)):
             listening_drop(path)
         if error or not text:
+            if self._thinking and self._pending_speech:
+                # 这一轮本来就在等她的回复，识别失败不影响已经排好的话
+                note(f"排队中的一句识别失败：{error or '（空）'}")
+                return
             self._thinking = False
             note(f"对话模式识别失败：{error or '（空）'}")
             self.say(error or "没听出文字，再说一次？", 8000)
             self._resume_after_reply()
             return
+        if self._thinking:
+            # 她正在回答，你插了一句：先记下来，等这轮落地后合并发出去（不丢话）
+            self._pending_speech.append(text)
+            del self._pending_speech[:-MAX_PENDING_SPEECH]
+            note(f"她还在说，先把这句排起来（{len(self._pending_speech)} 句）：{text}")
+            self.say(f"（记下了：「{text}」）", 2500)
+            return
         note(f"对话模式听成：{text}")
+        self._thinking = True
+        self._thinking_since = time.time()
         self.say(f"你：「{text}」", 2500)
         self._stream_text = ""
         client = self._client or self._make_client()
@@ -1416,6 +1459,24 @@ class PetWindow(QWidget):
                 )
             return
         client.send(text)
+
+    def flush_pending_speech(self) -> None:
+        """Send whatever the user said while she was answering, as one turn.
+
+        合并成一条是刻意的：连着说的两句（"诶对了" + "你帮我看看这个"）本来就该算一轮，
+        分成两条会让她回两次、也更像机器。
+        """
+        if not self._pending_speech:
+            return
+        merged = "；".join(self._pending_speech)
+        self._pending_speech.clear()
+        note(f"把排队的 {len(merged.split('；'))} 句并成一轮发出去：{merged}")
+        self.say(f"你：「{merged}」", 2500)
+        self._thinking = True
+        self._thinking_since = time.time()
+        self._stream_text = ""
+        client = self._client or self._make_client()
+        client.send(merged)
 
     def on_chat_chunk(self, text: str) -> None:
         """Show her answer while it is still being generated (streaming bubble).
@@ -1846,6 +1907,10 @@ class PetWindow(QWidget):
         self._stream_text = ""
         self._thinking = False
         self.say(text, SPEAK_BUBBLE_MS)
+        # 她在回答期间你插的话，现在并成一轮发出去（不丢话）
+        if self._pending_speech:
+            self.flush_pending_speech()
+            return
         # 她的回复到齐了：对话模式继续听下一句
         self._resume_after_reply()
 

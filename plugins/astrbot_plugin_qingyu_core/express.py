@@ -50,6 +50,10 @@ MINIMAL_HINTS = (
 # 延迟范围（毫秒）。
 MIN_DELAY_MS = 400
 MAX_DELAY_MS = 2500
+# 桌面语音轮的开口延迟上限：那个 0.4~2.5 秒的停顿是为**群聊**设计的（"秒回就是机器味"），
+# 但桌面上是面对面说话，语音一轮本来还要等识别和模型，再故意拖 1.4 秒就纯粹让人干等
+# （2026-09-25 用户反馈"还是不像真实对话"）。只对桌面通道生效，QQ 那边手感不变。
+DESKTOP_FAST_MAX_MS = 400
 # 被 @ 时的长度预算：闲聊按群的答话上限 × 好感度倍数；中等问题再翻倍；
 # 超过这个预算（检查单/知识库那类正经问题）就**不压长度**，答准更重要。
 SERIOUS_MIN_CAP = 40
@@ -304,15 +308,17 @@ def length_hint(plan: Plan | None) -> str | None:
     return None
 
 
-def delay_seconds(plan: Plan | None, text: str) -> float:
+def delay_seconds(plan: Plan | None, text: str, *, fast: bool = False) -> float:
     """How long to wait before the reply is sent.
 
     Args:
         plan: The decision for this turn.
         text: Incoming message text.
+        fast: 桌面语音轮传 ``True``：停顿压到 ``DESKTOP_FAST_MAX_MS`` 以内
+            （见该常量的注释；QQ 群聊仍走原来的 0.4~2.5 秒）。
 
     Returns:
-        Delay in seconds, always inside the configured range.
+        Delay in seconds, inside the configured range (``fast`` 时另受上限约束).
     """
     base_ms = plan.delay_ms if plan else 800
     if is_casual(plan, text):
@@ -320,22 +326,25 @@ def delay_seconds(plan: Plan | None, text: str) -> float:
         base_ms += random.randint(-300, 400)
     jitter = random.randint(-150, 450)
     millis = max(MIN_DELAY_MS, min(MAX_DELAY_MS, base_ms + jitter))
+    if fast:
+        millis = min(millis, DESKTOP_FAST_MAX_MS)
     return millis / 1000.0
 
 
-async def wait_before_reply(plan: Plan | None, text: str) -> float:
+async def wait_before_reply(plan: Plan | None, text: str, *, fast: bool = False) -> float:
     """Sleep for the computed delay so the reply does not look instant.
 
     Args:
         plan: The decision for this turn.
         text: Incoming message text.
+        fast: 桌面语音轮（见 :func:`delay_seconds`）。
 
     Returns:
         The delay that was applied, in seconds.
     """
-    seconds = delay_seconds(plan, text)
+    seconds = delay_seconds(plan, text, fast=fast)
     if seconds <= 0:
         return 0.0
     await asyncio.sleep(seconds)
-    logger.info(f"qingyu_core: 回复前停顿 {seconds:.2f} 秒")
+    logger.info(f"qingyu_core: 回复前停顿 {seconds:.2f} 秒{'（桌面快速档）' if fast else ''}")
     return seconds

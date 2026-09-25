@@ -756,7 +756,13 @@ class QingyuCorePlugin(Star):
             return
         event.set_extra("qingyu.delay_done", True)
         plan = event.get_extra("qingyu.plan")
-        await express.wait_before_reply(plan, event.message_str or "")
+        # 桌面通道＝面对面说话：走"快速档"（停顿 ≤0.4 秒），QQ 群聊那边保持原样。
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        await express.wait_before_reply(
+            plan,
+            event.message_str or "",
+            fast="desktop_pet" in umo,
+        )
 
     # ---------------------------------------------------------------- 行动层工具
 

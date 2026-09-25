@@ -48,7 +48,7 @@ VAD_SOURCES = (
     ),
     ("hf-mirror", "https://hf-mirror.com/csukuangfj/vad/resolve/main/silero_vad.onnx"),
 )
-DEFAULT_SILENCE_MS = 700  # 静音多久算"这句说完了"
+DEFAULT_SILENCE_MS = 450  # 静音多久算"这句说完了"（700→450：你要的是"接得快"，代价是句中被停顿切开的概率略升，靠排队合并兜住）
 DEFAULT_MIN_SPEECH_MS = 250  # 短于这个的当咳嗽/环境声，丢掉
 MAX_UTTERANCE_SECONDS = 20.0
 QUEUE_SECONDS = 8.0
