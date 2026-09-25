@@ -1282,6 +1282,7 @@ class PetWindow(QWidget):
             speaking=time.time() < getattr(self, "_speaking_until", 0.0),
             has_device=bool(microphone.devices()),
             already_running=self._listening_now(),
+            mic_enabled=bool(self.config.get("mic_listen", False)),
         )
         if not allowed:
             if reason and reason != "已经在听了":
@@ -1464,10 +1465,29 @@ class PetWindow(QWidget):
         note(f"视频通话 {'开' if checked else '关'}")
 
     def _start_video(self) -> None:
-        """Start the camera session and the preview window."""
+        """Start the camera session and the preview window.
+
+        **"视频通话"本身就要配着麦克风才有意义**（她的画面是跟着你的话走的），
+        所以这里顺手把「允许麦克风」和「对话模式」也打开，并把菜单勾选同步——
+        2026-09-25 的教训：这两个开关原来各自独立、文案还写着"你说完一句我就能看到你"，
+        用户于是只开了视频、说话时画面是关着的，看起来就是"这功能没用"。
+        """
         if not self.config.get("camera_capture", True):
             self.say("摄像头总开关关着呢（「允许摄像头」先勾上）。", 8000)
             return
+        turned_on: list[str] = []
+        if not self.config.get("mic_listen", False):
+            self.config["mic_listen"] = True
+            if getattr(self, "act_mic_on", None) is not None:
+                self.act_mic_on.setChecked(True)
+            turned_on.append("允许麦克风")
+        if not self._conversation_on():
+            self.config["conversation"] = True
+            if getattr(self, "act_conversation", None) is not None:
+                self.act_conversation.setChecked(True)
+            turned_on.append("对话模式")
+        if turned_on:
+            save_config(self.config)
         if self._video is None:
             self._video = camera.Session(self)
             self._video.failed.connect(self.on_video_failed)
@@ -1480,8 +1500,20 @@ class PetWindow(QWidget):
         if self.config.get("video_preview", True) and self._preview is None:
             self._preview = PreviewWindow()
             self._preview.move(self.x() - camera.PREVIEW_MAX_EDGE - 12, self.y())
-        self.say("视频通话开着——你说完一句我就能看到你（只有你这边开着）。", 9000)
-        note(f"视频通话开始（摄像头 {self._video.device_name()}）")
+        if turned_on:
+            self.say(
+                "视频通话开着——同时帮你打开了「" + "」「".join(turned_on) + "」。\n"
+                "直接说话就行，说完那一句她就看到当时的你（摄像头一直开着，"
+                "但只有说话那一刻的画面会发出去，发完就删）。",
+                12000,
+            )
+        else:
+            self.say("视频通话开着——说完一句她就看到当时的你。", 8000)
+        note(f"视频通话开始（摄像头 {self._video.device_name()}；同时打开：{turned_on or '无'}）")
+        # 视频要配着"听"才有意义：顺手把连续听也起起来
+        if self._conversation_on() and not self._listening_now():
+            self._conversation_touch()
+            self._start_listening()
 
     def _stop_video(self) -> None:
         """Release the camera and close the preview."""

@@ -156,6 +156,7 @@ def should_listen(
     speaking: bool,
     has_device: bool,
     already_running: bool,
+    mic_enabled: bool = True,
 ) -> tuple[bool, str]:
     """Decide whether the always-on listener may run right now.
 
@@ -166,12 +167,17 @@ def should_listen(
         speaking: She is currently talking.
         has_device: A microphone is visible.
         already_running: The listener is already running.
+        mic_enabled: The 麦克风总开关 (``mic_listen``) is on.
 
     Returns:
         ``(allowed, reason)`` — the reason is empty when allowed.
     """
     if not conversation:
         return False, "对话模式关着"
+    if not mic_enabled:
+        # 总开关就是总开关：对话模式不该绕过它。以前漏了这一条，
+        # 于是"麦克风总开关关着"时对话模式照样能录——2026-09-25 补上。
+        return False, "麦克风总开关关着（先勾「允许麦克风」）"
     if locked is True:
         return False, "你锁屏了"
     if thinking or speaking:

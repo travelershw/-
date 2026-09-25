@@ -85,6 +85,7 @@ class ShouldListenTest(unittest.TestCase):
             "speaking": False,
             "has_device": True,
             "already_running": False,
+            "mic_enabled": True,
         }
         args.update(overrides)
         return args
@@ -100,6 +101,7 @@ class ShouldListenTest(unittest.TestCase):
         """Turning conversation off, locking, thinking, speaking, or no device blocks it."""
         cases = {
             "conversation off": ("conversation", False),
+            "mic master off": ("mic_enabled", False),
             "locked": ("locked", True),
             "thinking": ("thinking", True),
             "speaking": ("speaking", True),
@@ -114,6 +116,10 @@ class ShouldListenTest(unittest.TestCase):
         allowed, reason = listening.should_listen(**self.base(speaking=True))
         self.assertFalse(allowed)
         self.assertIn("说话", reason)
+        # 总开关不可绕过（2026-09-25 补的闸门）
+        allowed, reason = listening.should_listen(**self.base(mic_enabled=False))
+        self.assertFalse(allowed)
+        self.assertIn("总开关", reason)
         print("PASS test_each_gate_blocks_on_its_own")
 
     def test_unknown_lock_state_does_not_block(self) -> None:

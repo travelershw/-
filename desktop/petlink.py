@@ -66,11 +66,17 @@ class PetLinkClient(QObject):
             return
         if self._loop is None or self._outbox is None:
             return
-        payload = json.dumps(
-            {"text": text, "image": image} if image else {"text": text},
-            ensure_ascii=False,
+        # 图片**两个键都发**：适配器读的是 `images`（列表），而这里历史上只发过 `image`（单数），
+        # 结果是"桌宠发的图全被静默丢掉"——她只收到文字，然后凭文字硬答（2026-09-25 查出）。
+        # 现在两边都兼容：新适配器读 images，旧适配器读 image，谁都不会再丢图。
+        payload = (
+            {"text": text, "image": image, "images": [image]}
+            if image
+            else {"text": text}
         )
-        asyncio.run_coroutine_threadsafe(self._outbox.put(payload), self._loop)
+        asyncio.run_coroutine_threadsafe(
+            self._outbox.put(json.dumps(payload, ensure_ascii=False)), self._loop
+        )
 
     def _run(self) -> None:
         """Own the asyncio loop for this connection (one attempt, no retry)."""

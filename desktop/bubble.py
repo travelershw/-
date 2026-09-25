@@ -7,6 +7,12 @@ from PySide6.QtWidgets import QWidget
 MAX_WIDTH = 260
 PADDING = 12
 TAIL = 9
+# 边框宽：paintEvent 里 body 从 (1,1) 开始、宽高各减 2，所以可用的文字宽度/高度都要把这 2px 扣掉。
+# 这里踩过坑（2026-09-25）：量尺寸时按 `MAX_WIDTH - 2*PADDING` 算，画的时候却在 `body` 上再缩
+# `PADDING`——于是**画布比量尺寸时窄 4px、矮 1px**，换行位置都不一样，多出来的那一行被切在底部，
+# 再被 AlignVCenter 上下各切一半。用户看到的就是"气泡上下被裁掉一部分"（2 倍缩放屏上更明显）。
+# 注意别用 `BORDER` 这个名字，下面是同名的边框**颜色**。
+BORDER_WIDTH = 1
 BG = QColor(252, 250, 246, 242)
 BORDER = QColor(120, 112, 128, 150)
 TEXT = QColor(48, 44, 56)
@@ -46,13 +52,18 @@ class Bubble(QWidget):
             return
         self._text = text
         metrics = QFontMetrics(self._font)
+        # 量尺寸用的框必须**和真正画文字的那个框完全一致**（宽度：去掉边框与左右内边距），
+        # 否则换行位置不同，最后一行会被切掉。
+        inner_width = MAX_WIDTH - 2 * PADDING - 2 * BORDER_WIDTH
         rect = metrics.boundingRect(
-            QRectF(0, 0, MAX_WIDTH - 2 * PADDING, 1000).toRect(),
+            QRectF(0, 0, inner_width, 1000).toRect(),
             Qt.TextWordWrap,
             text,
         )
-        width = max(120, rect.width() + 2 * PADDING)
-        height = rect.height() + 2 * PADDING + TAIL
+        width = max(120, rect.width() + 2 * PADDING + 2 * BORDER_WIDTH)
+        # 高度多给 2px 富余：字体度量在不同缩放/字体回退下会有 1px 级别的出入，
+        # 宁可气泡略微宽松，也不要把首行/末行切掉。
+        height = rect.height() + 2 * PADDING + TAIL + 2 * BORDER_WIDTH + 2
         self.resize(width, height)
         self.move(anchor.x() - width // 2, anchor.y() - height)
         self.show()

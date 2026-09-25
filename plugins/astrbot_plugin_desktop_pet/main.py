@@ -343,6 +343,11 @@ class DesktopPetPlatform(Platform):
         组件，管线就会走正常的图片流程（主模型不支持视觉时 AstrBot 会用配好的
         图片描述模型转成文字）。
 
+        **2026-09-25 修**：桌宠那边一直发的是 ``"image"``（单数、字符串），而这里只读
+        ``"images"``（复数、列表）——两边契约对不上，于是**桌宠发出的图全都被静默丢掉**：
+        她收到的只有一句"看看我屏幕上有什么"之类的文字，然后**凭文字硬答**。
+        现在两种键都收（``images`` 优先，兼容旧的 ``image``），免得再对上不。
+
         Args:
             raw: Raw websocket payload.
         """
@@ -355,7 +360,15 @@ class DesktopPetPlatform(Platform):
         if data.get("type") == "ping":
             return
         text = str(data.get("text") or "").strip()
-        images = [str(item) for item in (data.get("images") or []) if str(item).strip()]
+        raw_images = data.get("images")
+        if raw_images is None:
+            # 兼容桌宠旧版发的单数键（它一直发的是这个，所以才有了 2026-09-25 那次"图全丢了"）
+            raw_images = data.get("image")
+        if isinstance(raw_images, str):
+            raw_images = [raw_images]
+        if not isinstance(raw_images, (list, tuple)):
+            raw_images = []
+        images = [str(item) for item in raw_images if str(item).strip()]
         images = [item for item in images if Path(item).is_file()][:3]
         if not text and not images:
             return
