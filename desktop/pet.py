@@ -176,6 +176,7 @@ class NetSignals(QObject):
     model = Signal(str, str)  # (下载结果文本, 错误文本)
     model_progress = Signal(int, int)  # 已下字节, 总字节
     transcribed = Signal(str, str, str, bool)  # (wav 路径, 文字, 错误文本, 是不是"插话")
+    level = Signal(str)  # 麦克风电平检查的结果（一句话：测得值 + 判断）
 
 
 def fetch_weather(lat: float, lon: float, place: str):  # noqa: ANN202 - weather.Weather
@@ -304,11 +305,16 @@ def transcribe_clip(path: str, options: dict) -> tuple[str, str]:
         ``(text, error)`` — one of them is always empty.
     """
     try:
-        return asr.transcribe_with(path, options), ""
+        raw = asr.transcribe_with(path, options)
     except ASRError as exc:
         return "", str(exc)
     except Exception as exc:  # noqa: BLE001 - 后台线程必须自己兜住一切
         return "", f"{type(exc).__name__}: {exc}"
+    # 后处理：先改掉已知的错词，再判断这是不是"人话"（启发式，不是置信度——见 asr.py）
+    fixed, reason = asr.postprocess(raw, options)
+    if reason:
+        return "", reason
+    return fixed, ""
 
 
 def fetch_model(progress=None) -> tuple[str, str]:  # noqa: ANN001 - 可选回调
@@ -377,7 +383,7 @@ DEFAULT_CONFIG = {
     # 默认关；只在"对话模式"里工作；锁屏不听；她说话/思考时不听（防自激）；
     # 一段时间没交互自动退出。`voice` 是"她出声"的开关，**本轮先不做**，只留位。
     "conversation": False,
-    "vad_silence_ms": 450,
+    "vad_silence_ms": 600,
     "vad_min_speech_ms": 250,
     "conversation_idle_seconds": 180,
     "voice": False,
@@ -393,6 +399,9 @@ DEFAULT_CONFIG = {
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "model": "glm-asr",
         "api_key": "",
+        # 识别结果里**反复错的词**可以在这里写死对应关系（"听成什么": "其实是"）。
+        # 空表就用 asr.DEFAULT_REPLACEMENTS（她自己的名字那几种常见误识）。
+        "replacements": {},
     },
     # 独立版（分发给别人用）：local 自带大脑、填自己的 API Key；astrbot 连本机的 AstrBot
     "mode": "astrbot",
@@ -496,6 +505,7 @@ class PetWindow(QWidget):
         self._net.model.connect(self.on_model)
         self._net.model_progress.connect(self.on_model_progress)
         self._net.transcribed.connect(self.on_transcribed)
+        self._net.level.connect(self.on_mic_level)
         self._weather_busy = False
         self._geo_busy = False
         self._mic_busy = False
@@ -513,6 +523,8 @@ class PetWindow(QWidget):
         # P6：想/说期间你说的话不丢，先排队，等她这轮落地后合并成一条发出
         self._pending_speech: list[str] = []
         self._thinking_since = 0.0
+        # P7-a：短句先攒一会儿，把"被停顿切开的半句"拼回一整句再识别
+        self._segment_buffer: list = []
         self._state_timer = QTimer(self)
         self._state_timer.timeout.connect(self.check_conversation)
         self._state_timer.start(15_000)
@@ -646,6 +658,12 @@ class PetWindow(QWidget):
         act_asr_key = QAction("语音识别 Key…", self)
         act_asr_key.setToolTip("只在 asr.engine=openai（云端）时用；本机引擎不需要 Key")
         act_asr_key.triggered.connect(self.set_asr_key)
+        act_mic_pick = QAction("选择麦克风…", self)
+        act_mic_pick.setToolTip("识别不准时优先换到就近的麦克风（耳机麦通常比笔记本阵列好很多）")
+        act_mic_pick.triggered.connect(self.pick_microphone)
+        act_mic_level = QAction("麦克风电平检查…", self)
+        act_mic_level.setToolTip("录 3 秒说一句话，给出 dBFS 判断与建议（电平太低是识别错字的常见原因）")
+        act_mic_level.triggered.connect(self.check_microphone_level)
         act_model = QAction("下载本机模型…", self)
         act_model.setToolTip("本机识别用的中文模型（78 MB）+ 静音检测模型（0.6 MB），只下一次")
         act_model.triggered.connect(self.download_asr_model)
@@ -680,6 +698,8 @@ class PetWindow(QWidget):
         menu.addAction(self.act_conversation)
         menu.addAction(self.act_video)
         menu.addAction(act_asr_key)
+        menu.addAction(act_mic_pick)
+        menu.addAction(act_mic_level)
         menu.addAction(act_model)
         menu.addAction(act_line)
         menu.addAction(act_chat)
@@ -1422,15 +1442,59 @@ class PetWindow(QWidget):
                 daemon=True,
             ).start()
             return
-        # 注意：**这里不要停麦**。想/说期间继续采集，是"你能打断她"的前提；
-        # 采集到的句子由上面的 _thinking 分支排队，不会丢。
+        # 短段很可能是"一句话被停顿切成两半"：等一小会儿看有没有下一段，
+        # 有就把**音频拼起来重新识别一次**（切在词中间是识别出错的主因之一）。
+        if utterance.seconds < listening.SHORT_SEGMENT_SECONDS:
+            self._segment_buffer.append(utterance)
+            QTimer.singleShot(listening.MERGE_WINDOW_MS, self._flush_segments)
+            return
+        self._send_segments([utterance])
+
+    def _flush_segments(self) -> None:
+        """Send the buffered segment(s), merging audio when there are several."""
+        if not self._segment_buffer:
+            return
+        segments, self._segment_buffer = self._segment_buffer, []
+        self._send_segments(segments)
+
+    def _send_segments(self, segments: list) -> None:  # noqa: ANN001 - listening.Utterance
+        """Hand one utterance (or several merged into one clip) to recognition.
+
+        Args:
+            segments: One or more segments, in order.
+        """
+        self._conversation_touch()
+        if self._thinking:
+            # 合并期间她已经忙起来了：转文字后走排队（不丢话）
+            for item in segments:
+                threading.Thread(
+                    target=lambda path=item.path: self._net.transcribed.emit(
+                        path,
+                        *transcribe_clip(path, dict(self.config.get("asr") or {})),
+                        True,
+                    ),
+                    name="pet-talk-asr",
+                    daemon=True,
+                ).start()
+            return
+        clip_path = segments[0].path
+        seconds = sum(item.seconds for item in segments)
+        if len(segments) > 1:
+            merged = Path(segments[0].path).with_name(f"merged_{int(time.time() * 1000)}.wav")
+            if listening.merge_wavs([item.path for item in segments], merged):
+                for item in segments:
+                    listening_drop(item.path)
+                clip_path = str(merged)
+                note(f"把 {len(segments)} 段（{seconds:.1f} 秒）拼成一句再识别")
+            else:
+                note(f"{len(segments)} 段音频拼不起来，只识别第一段")
         self._thinking = True
         self._thinking_since = time.time()
         self.say(random.choice(LISTEN_ACKS), 1200)
         options = dict(self.config.get("asr") or {})
         threading.Thread(
             target=lambda: self._net.transcribed.emit(
-                utterance.path, *transcribe_clip(utterance.path, options), False
+                clip_path, *transcribe_clip(clip_path, options), False
             ),
             name="pet-talk-asr",
             daemon=True,
@@ -1653,6 +1717,68 @@ class PetWindow(QWidget):
             note(f"取实时帧失败：{frame.error}")
             return None
         return frame
+
+    def pick_microphone(self) -> None:
+        """Choose which microphone to use (menu 「选择麦克风…」).
+
+        「识别不准」很常见的一半原因是**用错麦**：笔记本自带的阵列麦是远场拾音，
+        而 USB 耳机麦是近讲——同一个模型在两者上差别很大，所以给出选择而不是写死。
+        """
+        devices = microphone.devices()
+        if not devices:
+            self.say("没找到麦克风。", 7000)
+            return
+        current = str(self.config.get("mic_device") or "")
+        labels = ["（系统默认）"] + [f"{index + 1}. {name}" for index, name in enumerate(devices)]
+        pick, ok = QInputDialog.getItem(
+            self,
+            "选择麦克风",
+            f"现在用的是：{current or '（系统默认）'}\n识别不准时优先换到就近的那个（通常是耳机麦）",
+            labels,
+            labels.index(f"{devices.index(current) + 1}. {current}") if current in devices else 0,
+            False,
+        )
+        if not ok or not pick:
+            return
+        chosen = "" if pick.startswith("（") else pick.split(". ", 1)[-1]
+        self.config["mic_device"] = chosen
+        save_config(self.config)
+        note(f"麦克风设为「{chosen or '系统默认'}」")
+        self.say(f"麦克风换成：{chosen or '系统默认'}（对话模式要重新开一次才生效）", 9000)
+        if self._listening_now():
+            self._stop_listening()
+            self._start_listening(force=True)
+
+    def check_microphone_level(self) -> None:
+        """Record a few seconds and report how loud the input is (menu 「麦克风电平检查…」).
+
+        电平太低是"识别不准"最便宜就能修的原因（远低于门限时字会被吞掉）。
+        这里给出**dBFS 与一句人话的判断**，而不是让你看数字自己猜。
+        """
+        if self._mic_busy:
+            self.say("上一条还在处理呢~", 4000)
+            return
+        self._mic_busy = True
+        self.say("录 3 秒——请正常说一句话（就说“轻语你在吗”）…", 5000)
+
+        def work() -> None:
+            clip = microphone.record(3, str(self.config.get("mic_device") or ""))
+            verdict = microphone.level_verdict(clip.rms, clip.peak)
+            if clip.path and not bool(self.config.get("mic_keep_clip", False)):
+                listening_drop(clip.path)
+            self._net.level.emit(f"{clip.describe()}\n{verdict}")
+
+        threading.Thread(target=work, name="pet-mic-level", daemon=True).start()
+
+    def on_mic_level(self, text: str) -> None:
+        """Report the measured input level (runs on the UI thread).
+
+        Args:
+            text: Measurement line plus the verdict/advice.
+        """
+        self._mic_busy = False
+        note("麦克风电平检查　" + text.replace("\n", "　"))
+        self.say(text, 15000)
 
     def set_asr_key(self) -> None:
         """Store a speech-to-text key (menu 「语音识别 Key…」)."""

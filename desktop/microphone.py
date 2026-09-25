@@ -131,6 +131,53 @@ def is_audible(rms: float, threshold: float = MIN_RMS) -> bool:
     return rms >= threshold
 
 
+# 语音识别的"甜区"：RMS 落在下面这个区间时字最不容易被吞（换成 dBFS 便于对照录音软件的刻度）。
+# 依据：16 位满量程 32768 → dBFS = 20*log10(rms/32768)。
+#   · 低于 -34 dBFS：远场/增益太低，辅音和词尾容易丢（实测出现过 RMS 7 ≈ -73 dBFS 的极端情况）
+#   · 高于 -12 dBFS：接近削波，爆音同样会毁掉识别
+LEVEL_LOW_DBFS = -34.0
+LEVEL_HIGH_DBFS = -12.0
+
+
+def dbfs(rms: float, full_scale: float = 32768.0) -> float:
+    """Convert an RMS level to dBFS.
+
+    Args:
+        rms: RMS level in sample units.
+        full_scale: Full-scale value for 16-bit samples.
+
+    Returns:
+        dBFS (very low for silence, never -inf so it stays printable).
+    """
+    if rms <= 0:
+        return -99.0
+    ratio = max(rms, 1e-6) / full_scale
+    return round(20 * math.log10(ratio), 1)
+
+
+def level_verdict(rms: float, peak: int = 0) -> str:
+    """One-line judgement of the input level, with advice.
+
+    Args:
+        rms: Measured RMS.
+        peak: Measured peak (used only to spot clipping).
+
+    Returns:
+        Chinese verdict plus what to do about it.
+    """
+    value = dbfs(rms)
+    if rms <= 0:
+        return "一点声音都没录到（检查麦克风静音键/输入设备）"
+    if value < LEVEL_LOW_DBFS:
+        return (
+            f"太小了（{value} dBFS）：把「设置 → 系统 → 声音 → 输入」的音量拉到 80–100，"
+            "或者换用就近的耳机麦克风——远场拾音是识别错字的第一大原因"
+        )
+    if value > LEVEL_HIGH_DBFS or peak >= 32700:
+        return f"太大了（{value} dBFS{'，已经削波' if peak >= 32700 else ''}）：把输入音量调低一点，爆音同样会毁掉识别"
+    return f"正常（{value} dBFS）——这个电平下识别最稳"
+
+
 def devices() -> list[str]:
     """Microphone names Qt can see.
 

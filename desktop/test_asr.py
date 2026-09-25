@@ -37,6 +37,54 @@ class FakeResponse:
         return False
 
 
+class PostprocessTest(unittest.TestCase):
+    """识别结果的后处理：先改已知错词，再判断是不是"人话"。"""
+
+    def test_replacements_fix_her_own_name(self) -> None:
+        """The common mis-hearings of 轻语 are corrected by default."""
+        self.assertEqual(asr.apply_replacements("青鱼你在吗"), "轻语你在吗")
+        self.assertEqual(asr.apply_replacements("轻宇，帮我看下"), "轻语，帮我看下")
+        self.assertEqual(asr.apply_replacements("轻语你好"), "轻语你好")
+        self.assertEqual(asr.apply_replacements(""), "")
+        print("PASS test_replacements_fix_her_own_name")
+
+    def test_custom_table_wins(self) -> None:
+        """A user table replaces the default one entirely."""
+        table = {"张三": "张三丰", "青鱼": "不动"}
+        self.assertEqual(asr.apply_replacements("青鱼和张三", table), "不动和张三丰")
+        # 空表 = 一个词都不改（用户想关掉默认纠正时用）
+        self.assertEqual(asr.apply_replacements("青鱼你在吗", {}), "青鱼你在吗")
+        print("PASS test_custom_table_wins")
+
+    def test_noise_verdicts(self) -> None:
+        """Empty, one-character and repeated sounds are named as noise."""
+        self.assertIn("什么都没听到", asr.looks_like_noise(""))
+        self.assertIn("什么都没听到", asr.looks_like_noise("   "))
+        self.assertIn("太短", asr.looks_like_noise("嗯"))
+        self.assertIn("太短", asr.looks_like_noise("啊？"))
+        self.assertIn("重复音", asr.looks_like_noise("喂喂喂喂喂喂"))
+        # 门限是"同一个字连续 5 次"：4 次是笑声/口癖，5 次才开始像没对着麦说话
+        self.assertIn("重复音", asr.looks_like_noise("哈哈哈哈哈哈"))
+        self.assertEqual(asr.looks_like_noise("哈哈哈哈"), "")
+        print("PASS test_noise_verdicts")
+
+    def test_real_sentences_pass(self) -> None:
+        """Normal sentences (including laughter) are not flagged as noise."""
+        for text in ("轻语你在吗", "帮我看一下这个", "今天天气怎么样", "哈哈", "哈哈哈", "嗯嗯好"):
+            self.assertEqual(asr.looks_like_noise(text), "", text)
+        print("PASS test_real_sentences_pass")
+
+    def test_postprocess_pairs(self) -> None:
+        """postprocess() returns the fixed text and a reason only when unusable."""
+        fixed, reason = asr.postprocess("青鱼你在吗", {})
+        self.assertEqual(fixed, "轻语你在吗")
+        self.assertEqual(reason, "")
+        fixed, reason = asr.postprocess("喂喂喂喂喂喂", {})
+        self.assertEqual(fixed, "喂喂喂喂喂喂")
+        self.assertTrue(reason)
+        print("PASS test_postprocess_pairs")
+
+
 class EndpointTest(unittest.TestCase):
     """URL building has to tolerate trailing slashes and already-complete URLs."""
 

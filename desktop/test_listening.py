@@ -317,6 +317,60 @@ class UtteranceTest(unittest.TestCase):
         print("PASS test_describe")
 
 
+class MergeWavsTest(unittest.TestCase):
+    """把"被停顿切开的半句"拼回一整句——切在词中间是识别出错的主因之一。"""
+
+    def setUp(self) -> None:
+        """Scratch directory."""
+        self.scratch = Path(__file__).resolve().parent / "_listen_test"
+        shutil.rmtree(self.scratch, ignore_errors=True)
+        self.scratch.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        """Clean up."""
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def test_concatenates_in_order(self) -> None:
+        """Two clips become one, and the samples are appended in the given order."""
+        first = self.scratch / "a.wav"
+        second = self.scratch / "b.wav"
+        listening.write_wav(floats(listening.SAMPLE_RATE // 2, 0.5), first)
+        listening.write_wav(floats(listening.SAMPLE_RATE // 4, -0.5), second)
+        target = self.scratch / "merged.wav"
+        self.assertTrue(listening.merge_wavs([str(first), str(second)], target))
+        with wave.open(str(target), "rb") as handle:
+            frames = handle.getnframes()
+            rate = handle.getframerate()
+            samples = listening.pcm_to_float(handle.readframes(frames))
+        self.assertAlmostEqual(frames / rate, 0.75, places=2)
+        self.assertAlmostEqual(samples[0], 0.5, places=2)  # 前半是正
+        self.assertAlmostEqual(samples[-1], -0.5, places=2)  # 后半是负
+        print("PASS test_concatenates_in_order")
+
+    def test_single_and_broken_inputs(self) -> None:
+        """One clip works; a missing file or a bad path fails cleanly."""
+        one = self.scratch / "a.wav"
+        listening.write_wav(floats(1000, 0.1), one)
+        target = self.scratch / "merged.wav"
+        self.assertTrue(listening.merge_wavs([str(one)], target))
+        self.assertFalse(listening.merge_wavs([str(one), str(self.scratch / "nope.wav")], target))
+        self.assertFalse(listening.merge_wavs([], target))
+        print("PASS test_single_and_broken_inputs")
+
+    def test_format_mismatch_is_refused(self) -> None:
+        """Different sample rates must not be spliced together."""
+        good = self.scratch / "good.wav"
+        other = self.scratch / "other.wav"
+        listening.write_wav(floats(2000, 0.2), good)
+        with wave.open(str(other), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00" * 2000)
+        self.assertFalse(listening.merge_wavs([str(good), str(other)], self.scratch / "m.wav"))
+        print("PASS test_format_mismatch_is_refused")
+
+
 class ModelTest(unittest.TestCase):
     """The VAD model download uses the shared verified store."""
 

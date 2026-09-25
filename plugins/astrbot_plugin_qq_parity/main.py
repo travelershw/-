@@ -27,6 +27,11 @@ from astrbot.core.agent.message import TextPart
 _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
 _USER_COOLDOWN_SECONDS = 8
 _COOLDOWN_TRACK_LIMIT = 512
+# 这些平台是"面对面"说话，不参与按用户冷却：
+#   webchat      面板控制台（原来就豁免）
+#   desktop_pet  本机桌面桌宠（打字聊天 + 语音对话）——你说一句她答一句，
+#                中间隔几秒是正常的，冷却只会把手快的人吃掉（2026-09-25 实测）
+_NO_COOLDOWN_PLATFORMS = frozenset({"webchat", "desktop_pet"})
 
 # Tag-like spans typed by chat participants must never act as markup: someone
 # writing "</think>" or "<|im_start|>" is trying to fake the model's own
@@ -164,7 +169,11 @@ class QqParityPlugin(Star):
         """
         if (
             not event.is_at_or_wake_command
-            or event.get_platform_name() == "webchat"
+            # webchat 是面板控制台；desktop_pet 是**你本人在桌面上跟她说话**（含语音对话）。
+            # 两者都是"面对面"，8 秒冷却在这里只会把你刚说的话**静默吃掉**：
+            # 2026-09-25 实测桌宠语音里"你好"之后 7.1 秒的"你在吗"被 stop_event 掐断、
+            # 连模型都没进，于是永远没有回复——用户看到的就是"只对第一句有反应"和"响应很慢"。
+            or event.get_platform_name() in _NO_COOLDOWN_PLATFORMS
             or not event.message_str.strip()
         ):
             return

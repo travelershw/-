@@ -31,6 +31,83 @@ class ASRError(Exception):
     """Recognition failed, with a message meant to be shown to the user."""
 
 
+# 识别结果后处理：把**反复错的那几个词**直接改对。
+# 为什么不用 sherpa 自带的 `hr_dict_dir`/`hr_lexicon`（同音替换）：那套要按它的词典格式摆文件、
+# 出错了很难判断是哪一层的问题；而"人名/群名/简称"这类错误是**固定映射**，
+# 一张表就够，还能离线测、你也能自己往里加词（config.json 的 asr.replacements）。
+DEFAULT_REPLACEMENTS = {
+    # 她自己的名字最常被听错——这几个是拼音相近的典型误识
+    "青鱼": "轻语",
+    "轻宇": "轻语",
+    "青玉": "轻语",
+    "轻雨": "轻语",
+    "青羽": "轻语",
+}
+# 明显不像人话的判定（不是"置信度"——paraformer 贪心解码不给这个词，
+# 所以这里用**可解释的规则**，宁可说"这是启发式"，也不假装有置信度）：
+NOISE_MIN_CHARS = 2  # 短于这个字数当噪声（"嗯""呃"这类单字）
+NOISE_REPEAT_RUN = 5  # 同一个字连续出现这么多次当噪声（实测"喂喂喂喂喂喂"就是没对着麦说话）
+
+
+def apply_replacements(text: str, replacements: dict | None = None) -> str:
+    """Rewrite known mis-heard words.
+
+    Args:
+        text: Raw transcript.
+        replacements: ``{wrong: right}`` map; falls back to :data:`DEFAULT_REPLACEMENTS`.
+
+    Returns:
+        The corrected text.
+    """
+    if not text:
+        return ""
+    table = DEFAULT_REPLACEMENTS if replacements is None else replacements
+    out = text
+    for wrong, right in (table or {}).items():
+        if wrong and isinstance(wrong, str) and isinstance(right, str):
+            out = out.replace(wrong, right)
+    return out
+
+
+def looks_like_noise(text: str) -> str:
+    """Is this transcript probably not something worth answering?
+
+    Args:
+        text: Transcript (after replacements).
+
+    Returns:
+        A Chinese reason when it looks like noise/filler, else an empty string.
+    """
+    clean = (text or "").strip()
+    if not clean:
+        return "什么都没听到"
+    stripped = "".join(char for char in clean if char.strip("，。！？、~… \u3000"))
+    if len(stripped) < NOISE_MIN_CHARS:
+        return f"只听到「{clean}」（太短，像语气词）"
+    run = 1
+    longest = 1
+    for prev, char in zip(clean, clean[1:]):
+        run = run + 1 if char == prev else 1
+        longest = max(longest, run)
+    if longest >= NOISE_REPEAT_RUN:
+        return f"听到的是重复音（「{clean}」），像是没对着麦克风说话"
+    return ""
+
+
+def postprocess(text: str, options: dict | None = None) -> tuple[str, str]:
+    """Clean one transcript: fix known words, then check for noise.
+
+    Args:
+        text: Raw transcript.
+        options: The ``asr`` config block (may carry ``replacements``).
+
+    Returns:
+        ``(text, reason)`` — ``reason`` is empty when the text looks usable.
+    """
+    fixed = apply_replacements(text, (options or {}).get("replacements"))
+    return fixed, looks_like_noise(fixed)
+
+
 def endpoint(base_url: str | None) -> str:
     """Build the transcription URL from a base URL.
 
@@ -239,11 +316,10 @@ def transcribe_with(path: str, options: dict) -> str:
     if engine == "local":
         # 绝对导入：pet_desktop 不是包（模块都是顶层导入的），相对导入会直接报错
         import local_asr  # noqa: PLC0415 - 延迟导入，缺引擎也不影响云端路线
-    else:
-        return transcribe(
-            path,
-            base_url=(options or {}).get("base_url"),
-            model=(options or {}).get("model"),
-            api_key=str((options or {}).get("api_key") or ""),
-        )
-    return local_asr.transcribe_file(path)
+        return local_asr.transcribe_file(path)
+    return transcribe(
+        path,
+        base_url=(options or {}).get("base_url"),
+        model=(options or {}).get("model"),
+        api_key=str((options or {}).get("api_key") or ""),
+    )

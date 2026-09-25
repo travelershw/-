@@ -180,6 +180,34 @@ class SourceGuardTest(unittest.TestCase):
         print("PASS test_qbuffer_is_not_given_a_temporary")
 
 
+class LevelVerdictTest(unittest.TestCase):
+    """电平判断：识别不准最常见的原因就是输入太小（或太大削波）。"""
+
+    def test_dbfs_scale(self) -> None:
+        """Full scale is 0 dBFS; half is about -6; silence is a printable low value."""
+        self.assertAlmostEqual(microphone.dbfs(32768), 0.0, places=1)
+        self.assertAlmostEqual(microphone.dbfs(16384), -6.0, places=1)
+        self.assertEqual(microphone.dbfs(0), -99.0)
+        self.assertLess(microphone.dbfs(7), -70)  # 实测出现过 RMS 7 这种极端情况
+        print("PASS test_dbfs_scale")
+
+    def test_verdicts(self) -> None:
+        """Too quiet, too loud, clipped, and normal each get their own advice."""
+        self.assertIn("一点声音都没录到", microphone.level_verdict(0, 0))
+        quiet = microphone.level_verdict(30, 200)
+        self.assertIn("太小了", quiet)
+        self.assertIn("耳机", quiet)  # 建议里要提到换就近的麦克风
+        loud = microphone.level_verdict(9000, 32767)
+        self.assertIn("太大", loud)
+        clipped = microphone.level_verdict(3000, 32700)
+        self.assertIn("削波", clipped)
+        good = microphone.level_verdict(1500, 12000)
+        self.assertIn("正常", good)
+        # 边界：恰好落在低阈值上不算太小（用 < 而不是 <=）
+        self.assertIn("正常", microphone.level_verdict(32768 * 10 ** (-34 / 20), 5000))
+        print("PASS test_verdicts")
+
+
 class DevicesTest(unittest.TestCase):
     """Device listing must never raise, even without Qt Multimedia."""
 

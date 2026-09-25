@@ -48,7 +48,7 @@ VAD_SOURCES = (
     ),
     ("hf-mirror", "https://hf-mirror.com/csukuangfj/vad/resolve/main/silero_vad.onnx"),
 )
-DEFAULT_SILENCE_MS = 450  # 静音多久算"这句说完了"（700→450：你要的是"接得快"，代价是句中被停顿切开的概率略升，靠排队合并兜住）
+DEFAULT_SILENCE_MS = 600  # 静音多久算"这句说完了"（700→450 太急、又回到 600：句中停顿被切碎才是识别错的主因）
 DEFAULT_MIN_SPEECH_MS = 250  # 短于这个的当咳嗽/环境声，丢掉
 MAX_UTTERANCE_SECONDS = 20.0
 QUEUE_SECONDS = 8.0
@@ -231,6 +231,55 @@ def write_wav(samples, path: Path) -> bool:  # noqa: ANN001 - float 列表
             handle.setframerate(SAMPLE_RATE)
             handle.writeframes(payload.tobytes())
     except (OSError, ValueError):
+        return False
+    return True
+
+
+# 一句话中间停顿一下，VAD 就会把它切成两段。**切在词中间**是识别出错的一大来源
+# （尤其人名/数字），所以把相邻两段的**音频拼起来重新识别一次**，而不是分别识别再拼文字——
+# 后者丢掉了跨段的上下文（2026-09-25 加）。
+SHORT_SEGMENT_SECONDS = 1.2  # 短于这个的段很可能是半句话，值得等一等合并
+MERGE_WINDOW_MS = 600  # 等一下看看有没有下一段
+
+
+def merge_wavs(paths, target: Path) -> bool:  # noqa: ANN001 - 路径列表
+    """Concatenate several 16 kHz mono wav files into one.
+
+    Args:
+        paths: Source wav paths, in order.
+        target: Destination path.
+
+    Returns:
+        True when the merged file was written.
+    """
+    frames = bytearray()
+    params = None
+    for item in paths:
+        try:
+            with wave.open(str(item), "rb") as handle:
+                current = (
+                    handle.getnchannels(),
+                    handle.getsampwidth(),
+                    handle.getframerate(),
+                )
+                if params is None:
+                    params = current
+                elif params != current:
+                    return False  # 格式不一致就别硬拼
+                frames.extend(handle.readframes(handle.getnframes()))
+        except (OSError, wave.Error):
+            return False
+    if params is None or not frames:
+        return False
+    channels, width, rate = params
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(target), "wb") as handle:
+            handle.setnchannels(channels)
+            handle.setsampwidth(width)
+            handle.setframerate(rate)
+            handle.writeframes(bytes(frames))
+    except OSError:
         return False
     return True
 
