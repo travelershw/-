@@ -1,0 +1,1311 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>轻语</title>
+<!--
+  轻语手机端的本地页面(打包进 APK 的 assets,不是远程页面)。
+
+  阶段 2:按住说话真的录音(原生 AudioRecord + 蓝牙耳机麦)、拍照真的上传、
+  她的语音按到达顺序排队播放。纯计算部分(WAV 封装、组帧、base64)在 pure.js 里,
+  那一份能用 node tools/page-protocol-test.js 在没有手机的情况下验证。
+
+  与家里的协议(家里那侧已实测,字段名不要改):
+    手机 → 家: {"type":"hello"}
+               {"type":"utterance","sample_rate":16000,"channels":1,"secs":1.2} + 二进制(wav)
+               {"type":"text","text":"…"}
+               {"type":"image","mime":"image/jpeg","text":"看看这个"} + 二进制 JPEG
+               {"type":"ping"}
+    家 → 手机: {"type":"ready","format":"pcm16","sample_rate":16000,"channels":1,"channel":"…"}
+               {"type":"you","text":"…","secs":1.2,"level_dbfs":-20.1,"asr_ms":35}
+               {"type":"her","text":"…"}
+               {"type":"audio_begin","format":"pcm16","sample_rate":24000,"channels":1}
+               + 二进制裸 PCM + {"type":"audio_end","reason":"finished","row":{…}}
+               {"type":"error","message":"…"}
+    鉴权: WebSocket 握手 URL 带 ?token=<令牌>
+
+  原生回调(由 Java 通过 evaluateJavascript 调进来,同时挂在 window.QingyuNative
+  与 window.QingyuHooks 两处):
+    onAudio(base64Pcm) / onLevel(dbfs) / onRecordingStopped(reason)
+    onPhoto(base64Jpeg, text) / onPermission(name, granted)
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #15161a;
+    --card: #1e2027;
+    --line: #33363f;
+    --fg: #e8eaf0;
+    --dim: #9aa0ad;
+    --accent: #5b8cff;
+    --ok: #3ecf8e;
+    --bad: #ff6b6b;
+    --warn: #ffb84d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+    padding: 12px 12px calc(24px + env(safe-area-inset-bottom));
+  }
+  h1 { font-size: 20px; margin: 4px 0 2px; }
+  h2 { font-size: 14px; margin: 0 0 8px; color: var(--dim); font-weight: 600; }
+  .sub { color: var(--dim); font-size: 12px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px;
+    margin: 12px 0;
+  }
+  .card.route { border-color: #3a4a6b; }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 8px 0 4px; }
+  input {
+    width: 100%;
+    background: #121317;
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 14px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  .row > * { flex: 1; }
+  button {
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #fff;
+    border-radius: 8px;
+    padding: 11px 12px;
+    font-size: 15px;
+    font-weight: 600;
+  }
+  button.ghost { background: transparent; color: var(--fg); border-color: var(--line); }
+  button.big { padding: 20px 12px; font-size: 16px; }
+  button.live { background: var(--bad); border-color: var(--bad); color: #fff; }
+  #ptt { background: var(--ok); border-color: var(--ok); color: #08130d; }
+  #ptt.live { background: var(--bad); border-color: var(--bad); color: #fff; }
+  .status {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: #121317;
+    border: 1px solid var(--line);
+    font-size: 13px;
+    word-break: break-all;
+  }
+  .status.ok { border-color: var(--ok); color: var(--ok); }
+  .status.bad { border-color: var(--bad); color: var(--bad); }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  select {
+    width: 100%;
+    background: #121317;
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 14px;
+  }
+  label.inline { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--fg); }
+  label.inline input { width: auto; }
+  .meter {
+    height: 12px;
+    border-radius: 6px;
+    background: #121317;
+    border: 1px solid var(--line);
+    overflow: hidden;
+    margin-top: 12px;
+  }
+  .meter > div {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #3ecf8e, #ffb84d 70%, #ff6b6b);
+    transition: width .08s linear;
+  }
+  .meterline { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); margin-top: 4px; }
+  .facts { font-size: 13px; }
+  .facts div { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; border-bottom: 1px dashed #2a2d34; }
+  .facts span:last-child { color: var(--dim); text-align: right; word-break: break-all; }
+  .route-main { font-size: 17px; font-weight: 700; margin: 2px 0 6px; word-break: break-all; }
+  .route-main.yes { color: var(--ok); }
+  .route-main.no { color: var(--warn); }
+  .verdict {
+    padding: 9px 11px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    font-size: 13.5px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    word-break: break-all;
+  }
+  .verdict.ok { border-color: var(--ok); color: var(--ok); background: rgba(62, 207, 142, .08); }
+  .verdict.warn { border-color: var(--warn); color: var(--warn); background: rgba(255, 184, 77, .08); }
+  .verdict.bad { border-color: var(--bad); color: var(--bad); background: rgba(255, 107, 107, .10); }
+  .facts div.ok span:last-child { color: var(--ok); }
+  .facts div.warn span:last-child { color: var(--warn); }
+  .facts div.bad span:last-child { color: var(--bad); }
+  .log {
+    margin: 0;
+    max-height: 38vh;
+    overflow-y: auto;
+    background: #0f1013;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .said { margin: 6px 0; }
+  .said b { color: var(--accent); }
+  .said.her b { color: var(--ok); }
+  .steps { font-size: 13.5px; }
+  .steps div { padding: 6px 0; border-bottom: 1px dashed #2a2d34; }
+  .steps b { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>轻语</h1>
+<div class="sub">手机端 v<span id="appVersion">…</span> · 按住说话 · 拍照给她看 · 她用自己的声音回答</div>
+
+<section id="guideCard" class="card" style="display:none">
+  <h2>三步用起来(第一次使用)</h2>
+  <div class="steps">
+    <div><b>①</b> 手机装 <b>Tailscale</b> 并登录<b>和家里电脑同一个账号</b>(在外面也能连)。手机和电脑在<b>同一个 WiFi</b> 时这步可以跳过。</div>
+    <div><b>②</b> 填服务器地址:点下面的「家里(Tailscale)」;同一个 WiFi 就点「同一个 WiFi」,再把 IP 改成电脑的局域网地址。令牌通常留空。</div>
+    <div><b>③</b> 点「连接」。状态显示"已握手 ready"就通了 —— 按住「按住说话」说一句,松开就会发出去。</div>
+  </div>
+  <div class="row">
+    <button id="guideClose" class="ghost">知道了,不再显示</button>
+  </div>
+</section>
+
+<section class="card">
+  <h2>连接</h2>
+  <label for="address">服务器地址(家里的 phone_bridge.py)</label>
+  <input id="address" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <div class="row">
+    <button id="presetTailscale" class="ghost">家里(Tailscale)</button>
+    <button id="presetLan" class="ghost">同一个 WiFi</button>
+  </div>
+  <div id="presetHint" class="hint">家里(Tailscale):装了 Tailscale 并登录同一账号,任何网络都能用。同一个 WiFi:填电脑的局域网地址即可。</div>
+  <label for="token">令牌</label>
+  <input id="token" type="password" autocomplete="off" spellcheck="false">
+  <div class="hint">留空则用 tailnet 身份认证(手机装了 Tailscale 并登录同一账号时)。</div>
+  <div class="row">
+    <button id="connect">连接</button>
+    <button id="disconnect" class="ghost">断开</button>
+  </div>
+  <div id="status" class="status">未连接</div>
+  <div id="handshake" class="hint">握手结果会显示在这里</div>
+  <div class="hint">连接成功后会自动挂一个常驻通知保活(切后台/熄屏不再被系统掐断);断开时自动撤掉。</div>
+</section>
+
+<section class="card route">
+  <h2>耳机诊断(看不到耳机就点"刷新路由")</h2>
+  <div id="r-verdict" class="verdict warn">正在读取路由…</div>
+  <div id="r-rows" class="facts"></div>
+  <div id="r-last" class="hint">本次录音:还没录过</div>
+
+  <label for="scoMode">SCO 方式(蓝牙麦克风用;本机大概率只有「只用手机麦」可用)</label>
+  <select id="scoMode">
+    <option value="phone">只用手机麦(本机推荐)</option>
+    <option value="auto">自动(实验:先新接口,不成就换老接口)</option>
+    <option value="new">新接口 setCommunicationDevice(实验,本机大概率不可用)</option>
+    <option value="legacy">老接口 startBluetoothSco(实验,本机大概率不可用)</option>
+  </select>
+  <label class="inline"><input id="allowTier3" type="checkbox"> 允许档3:直接给 AudioRecord 指定蓝牙设备(实验,默认关)</label>
+
+  <div class="row">
+    <button id="refreshRoute" class="ghost">刷新路由</button>
+    <button id="requestBt" class="ghost">申请权限</button>
+  </div>
+  <div class="row">
+    <button id="probeSco" class="ghost">SCO 试验(约 3 秒,不录音)</button>
+  </div>
+  <div class="row">
+    <button id="copyDiag" class="ghost">复制诊断(粘给我看)</button>
+  </div>
+  <div id="batteryHint" class="hint" style="display:none">华为/鸿蒙还会额外限制后台:设置 → 应用和服务 → 应用管理 → 轻语 → 耗电管理 → 允许后台活动(把「允许后台活动」打开,否则熄屏久了连接还是会断)。</div>
+  <div class="hint">未录音时蓝牙耳机本来就不在输入设备列表里(SCO 要录音时才建立),所以看「可用通信设备」「HFP 状态」「A2DP 状态」这几行才准。</div>
+  <pre id="r-probe" class="log">还没做过 SCO 试验:点上面的按钮,它会不录音地把蓝牙通话链路按时间线跑一遍(每 200 ms 采一次,共 2 秒),并给出结论。</pre>
+</section>
+
+<section class="card">
+  <h2>说话与拍照</h2>
+  <div class="row">
+    <button id="ptt" class="big">按住说话</button>
+    <button id="camera" class="big ghost">拍照</button>
+  </div>
+  <div class="meter"><div id="levelBar"></div></div>
+  <div class="meterline"><span id="levelText">-100.0 dBFS</span><span id="recordText">未录音</span></div>
+  <div id="placeholder" class="hint">按住说话:松开即发送(16 kHz 单声道 WAV)&nbsp;·&nbsp;拍照:拍完自动缩放上传</div>
+</section>
+
+<section class="card">
+  <h2>她听到的 / 她说的</h2>
+  <div id="heard" class="hint">还没有收到 you 帧。按住说话说一句,这里会显示识别结果、电平和耗时。</div>
+  <div id="dialogue"></div>
+  <div class="facts" style="margin-top:10px">
+    <div><span>本轮上行时长</span><span id="s-up">—</span></div>
+    <div><span>本地录音电平</span><span id="s-level">—</span></div>
+    <div><span>服务端音频首字节</span><span id="s-first">—</span></div>
+    <div><span>服务端语音总长</span><span id="s-audio">—</span></div>
+  </div>
+  <label for="textInput">文字直发(协议 type=text,不经过录音)</label>
+  <div class="row">
+    <input id="textInput" type="text" placeholder="说点什么…">
+    <button id="sendText" style="flex:0 0 84px">发送</button>
+  </div>
+</section>
+
+<section class="card">
+  <h2>诊断</h2>
+  <div class="facts">
+    <div><span>原生桥</span><span id="f-bridge">检测中…</span></div>
+    <div><span>当前地址</span><span id="f-address">—</span></div>
+    <div><span>应用 / 系统</span><span id="f-version">—</span></div>
+    <div><span>权限</span><span id="f-perm">—</span></div>
+    <div><span>麦克风 / 相机硬件</span><span id="f-hw">—</span></div>
+    <div><span>播放引擎</span><span id="f-audio">未创建</span></div>
+  </div>
+  <h2 style="margin-top:12px">帧日志</h2>
+  <pre id="log" class="log"></pre>
+  <div class="row">
+    <button id="clearLog" class="ghost">清空日志</button>
+    <button id="ping" class="ghost">发 ping</button>
+  </div>
+</section>
+
+<script src="pure.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // 页面侧的默认地址;正常情况下会被原生桥的 default_address 覆盖。
+  // 里面的 <令牌> 会在连接时替换成令牌输入框的内容。
+  var FALLBACK_DEFAULT_ADDRESS = 'wss://laptop-u3hj61a7.tail35209a.ts.net:8443/?token=<令牌>';
+  var UPLINK_RATE = 16000;
+  var MAX_LOG_LINES = 300;
+
+  var pure = window.QingyuPure || null;
+
+  var el = {};
+  ['address', 'token', 'connect', 'disconnect', 'status', 'handshake', 'ptt', 'camera',
+   'placeholder', 'textInput', 'sendText', 'dialogue', 'heard', 'log', 'clearLog', 'ping',
+   'levelBar', 'levelText', 'recordText', 'refreshRoute', 'requestBt', 'r-verdict', 'r-rows',
+   'r-last', 'scoMode', 'allowTier3', 'copyDiag', 'probeSco', 'r-probe', 'batteryHint',
+   'presetTailscale', 'presetLan', 'presetHint', 'guideCard', 'guideClose', 'appVersion',
+   's-up', 's-level', 's-first', 's-audio',
+   'f-bridge', 'f-address', 'f-version', 'f-perm', 'f-hw', 'f-audio'].forEach(function (id) {
+    el[id] = document.getElementById(id);
+  });
+
+  // ---------------------------------------------------------------- 原生桥
+  var bridgeReady = !!(window.QingyuNative && typeof window.QingyuNative.getInfo === 'function');
+
+  /**
+   * 调原生桥。桥不存在(比如在浏览器里打开这个页面)时返回 null,
+   * 并把这件事写进日志,免得后面出现"设置记不住""录不上音"这种莫名其妙的现象。
+   */
+  function native(method, args) {
+    if (!bridgeReady) { return null; }
+    try {
+      return window.QingyuNative[method].apply(window.QingyuNative, args || []);
+    } catch (error) {
+      logLine('桥调用 ' + method + ' 失败: ' + error);
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------- 日志
+  // 手写补零,不用 String.padStart:老 WebView(Chrome 51 一档)没有它,
+  // 一旦抛异常整个页面就白屏,而这里是启动路径上的第一行。
+  function pad(value, width) {
+    var text = String(value);
+    while (text.length < width) { text = '0' + text; }
+    return text;
+  }
+
+  function stamp() {
+    var d = new Date();
+    return pad(d.getHours(), 2) + ':' + pad(d.getMinutes(), 2) + ':' + pad(d.getSeconds(), 2) + '.' + pad(d.getMilliseconds(), 3);
+  }
+
+  /** 往诊断面板追加一行,并单独把日志文本也丢给 logcat。 */
+  function logLine(text, toLogcat) {
+    var line = stamp() + '  ' + text;
+    el.log.textContent += line + '\n';
+    var lines = el.log.textContent.split('\n');
+    if (lines.length > MAX_LOG_LINES) {
+      el.log.textContent = lines.slice(lines.length - MAX_LOG_LINES).join('\n');
+    }
+    el.log.scrollTop = el.log.scrollHeight;
+    if (toLogcat !== false) { native('log', [line]); }
+  }
+
+  function setStatus(text, kind) {
+    el.status.textContent = text;
+    el.status.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function setHint(text) { el.placeholder.textContent = text; }
+
+  function said(who, text) {
+    if (!text) { return; }
+    var div = document.createElement('div');
+    div.className = 'said' + (who === 'her' ? ' her' : '');
+    var b = document.createElement('b');
+    b.textContent = (who === 'her' ? '她: ' : '你: ');
+    div.appendChild(b);
+    div.appendChild(document.createTextNode(text));
+    el.dialogue.appendChild(div);
+  }
+
+  // ---------------------------------------------------------------- 设置读写
+  /** 地址与令牌都存 SharedPreferences;桥不可用时退回 localStorage。 */
+  function loadConfig() {
+    var config = native('getConfig', []);
+    var parsed = null;
+    if (config) {
+      try { parsed = JSON.parse(config); } catch (error) { logLine('原生配置不是合法 JSON: ' + error); }
+    }
+    var fallback = null;
+    try { fallback = JSON.parse(localStorage.getItem('qingyu.config') || 'null'); } catch (error) { fallback = null; }
+
+    // MainActivity 也会把保存过的值作为查询参数带过来,作为最后一层兜底
+    var query = new URLSearchParams(window.location.search);
+
+    var address = (parsed && parsed.address) || (fallback && fallback.address) || query.get('address') || '';
+    var token = (parsed && parsed.token) || (fallback && fallback.token) || query.get('token') || '';
+    var def = (parsed && parsed.default_address) || FALLBACK_DEFAULT_ADDRESS;
+
+    el.address.value = address || def;
+    el.token.value = token;
+    el.address.placeholder = def;
+    return def;
+  }
+
+  /** 保存设置:原生优先,localStorage 与查询参数路径只是兜底。 */
+  /**
+   * 读取"是否已经保存过服务器地址":原生优先,localStorage 兜底。
+   * 用来判断是不是第一次使用(第一次就给三步引导)。
+   */
+  function readSavedAddress() {
+    var config = native('getConfig', []);
+    if (config) {
+      try {
+        var parsed = JSON.parse(config);
+        if (parsed && parsed.address) { return String(parsed.address); }
+      } catch (error) {
+        // 落到 localStorage
+      }
+    }
+    try {
+      var local = JSON.parse(localStorage.getItem('qingyu.config') || 'null');
+      if (local && local.address) { return String(local.address); }
+    } catch (error) {
+      // 没有就没有
+    }
+    return '';
+  }
+
+  function saveConfig(silent) {
+    var address = el.address.value.trim();
+    var token = el.token.value.trim();
+    var ok = native('saveConfig', [address, token]);
+    try { localStorage.setItem('qingyu.config', JSON.stringify({ address: address, token: token })); } catch (error) { /* 存储不可用无所谓 */ }
+    updateAddressFact();
+    if (!silent) { logLine('已保存设置' + (ok === true ? '(SharedPreferences)' : '(仅本页)'), true); }
+  }
+
+  /**
+   * 把界面上的地址 + 令牌拼成真正的连接 URL。
+   * @param withSecret false 时把令牌打码,只用于显示。
+   */
+  function resolveUrl(withSecret) {
+    var raw = el.address.value.trim() || FALLBACK_DEFAULT_ADDRESS;
+    if (!/^(wss?|https?):\/\//i.test(raw)) {
+      // 只填了主机名时按 wss 补全(正常路径永远是 wss)
+      raw = 'wss://' + raw.replace(/^\/+/, '');
+    }
+    var token = el.token.value.trim();
+    var encoded = encodeURIComponent(token);
+    var url = raw.replace(/<令牌>/g, encoded);
+    if (!/[?&]token=/.test(url)) {
+      url += (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encoded;
+    }
+    if (withSecret) { return url; }
+    return url.replace(/token=[^&]*/, token ? 'token=***' : 'token=');
+  }
+
+  function updateAddressFact() {
+    el['f-address'].textContent = resolveUrl(false);
+  }
+
+  // ---------------------------------------------------------------- WebSocket
+  var socket = null;
+  var audioContext = null;
+  var nextPlayTime = 0;
+  var audioSegments = 0;
+  var inAudioSegment = false;
+  var audioRate = 24000;
+  var lastLevel = -100;
+  /** 用户是否希望保持连接(主动断开才置 false)—— 决定断线后要不要自动重连。 */
+  var wantConnected = false;
+  var reconnectAttempts = 0;
+  var rejoinCount = 0;
+  var reconnectTimer = null;
+  var pingTimer = null;
+
+  function wsOpen() {
+    return !!socket && socket.readyState === WebSocket.OPEN;
+  }
+
+  function sendJson(object) {
+    if (!wsOpen()) {
+      logLine('→ 未连接,丢弃 ' + object.type);
+      return false;
+    }
+    socket.send(JSON.stringify(object));
+    logLine('→ ' + object.type + ' ' + JSON.stringify(object));
+    return true;
+  }
+
+  function connect() {
+    wantConnected = true;
+    cancelReconnect();
+    disconnect(true);
+    saveConfig(true);
+    var url = resolveUrl(true);
+    setStatus('连接中…', '');
+    logLine('连接 ' + resolveUrl(false));
+    updateAddressFact();
+    unlockAudio();
+
+    var sock;
+    try {
+      sock = new WebSocket(url);
+    } catch (error) {
+      setStatus('WebSocket 建不起来: ' + error.message, 'bad');
+      logLine('WebSocket 构造失败: ' + error.message);
+      scheduleReconnect('构造失败');
+      return;
+    }
+    sock.binaryType = 'arraybuffer';
+    socket = sock;
+
+    sock.onopen = function () {
+      if (sock !== socket) { return; }
+      var rejoined = reconnectAttempts > 0;
+      reconnectAttempts = 0;
+      if (rejoined) { rejoinCount += 1; }
+      logLine('← (TCP/TLS 已建立)' + (rejoined ? '(第 ' + rejoinCount + ' 次重连成功)' : ''));
+      setStatus(rejoined ? '已重连(' + rejoinCount + ' 次)' : '已连接,等待 ready', 'ok');
+      // 每次(重)连都要重新握手:家里那侧靠 hello 认这个连接
+      sendJson({ type: 'hello' });
+      refreshRoute();
+      // 连接期间挂前台服务保活,免得切后台被系统掐断
+      native('startKeepAlive', []);
+      startPingTimer();
+    };
+
+    sock.onmessage = function (event) {
+      if (sock !== socket) { return; }
+      if (typeof event.data === 'string') {
+        handleTextFrame(event.data);
+      } else {
+        handleBinaryFrame(event.data);
+      }
+    };
+
+    sock.onerror = function () {
+      if (sock !== socket) { return; }
+      logLine('← socket 错误(地址/证书/端口不通时都会到这里)');
+      setStatus('连接出错,详见下方帧日志', 'bad');
+    };
+
+    sock.onclose = function (event) {
+      if (sock !== socket) { return; }
+      socket = null;
+      inAudioSegment = false;
+      stopPingTimer();
+      logLine('← 连接关闭 code=' + event.code + (event.reason ? ' reason=' + event.reason : ''));
+      if (wantConnected) {
+        // 系统在切后台/熄屏时会直接掐掉连接(实测 10–80 秒),所以必须自动重连
+        scheduleReconnect('code=' + event.code);
+      } else {
+        setStatus('已断开 (code=' + event.code + ')', event.code === 1000 ? '' : 'bad');
+      }
+      el['f-audio'].textContent = '空闲';
+    };
+  }
+
+  /** 安排一次重连(指数退避,上限 10 秒)。 */
+  function scheduleReconnect(reason) {
+    if (!wantConnected || reconnectTimer) { return; }
+    reconnectAttempts += 1;
+    var delay = pure ? pure.nextReconnectDelay(reconnectAttempts) : Math.min(10000, 1000 * reconnectAttempts);
+    setStatus('连接断了(' + reason + '),' + Math.round(delay / 1000) + ' 秒后自动重连(第 ' + reconnectAttempts + ' 次)', 'bad');
+    logLine('安排重连:第 ' + reconnectAttempts + ' 次,' + delay + ' ms 后');
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      if (wantConnected) { connect(); }
+    }, delay);
+  }
+
+  /** 取消待重连(用户主动断开或已经在连了)。 */
+  function cancelReconnect() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  /** 心跳:每 25 秒发一次 ping,既保活也让死链路早点暴露。 */
+  function startPingTimer() {
+    stopPingTimer();
+    pingTimer = setInterval(function () {
+      if (wsOpen()) { sendJson({ type: 'ping' }); }
+    }, 25000);
+  }
+
+  function stopPingTimer() {
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+  }
+
+  function disconnect(silent) {
+    if (!silent) { wantConnected = false; }
+    if (!silent) { cancelReconnect(); }
+    stopPingTimer();
+    if (!socket) {
+      if (!silent) {
+        native('stopKeepAlive', []);
+        logLine('主动断开');
+        setStatus('已断开', '');
+      }
+      return;
+    }
+    var sock = socket;
+    socket = null;
+    try { sock.close(1000, 'user'); } catch (error) { /* 已经关了 */ }
+    if (!silent) {
+      native('stopKeepAlive', []);
+      logLine('主动断开(已撤掉后台保活)');
+      setStatus('已断开', '');
+    }
+  }
+
+  /** 文本帧:全是 JSON。每帧都进日志 —— 现场排查主要靠它。 */
+  function handleTextFrame(text) {
+    var frame;
+    try {
+      frame = JSON.parse(text);
+    } catch (error) {
+      logLine('← 非 JSON 文本帧: ' + text.slice(0, 120));
+      return;
+    }
+    var type = frame.type || '(无 type)';
+    logLine('← ' + type + ' ' + JSON.stringify(frame));
+
+    if (type === 'ready') {
+      el.handshake.textContent = 'ready: format=' + frame.format + ' · sample_rate=' + frame.sample_rate
+        + ' · channels=' + frame.channels + (frame.channel ? ' · channel=' + frame.channel : '');
+      setStatus('已握手 ready', 'ok');
+      audioRate = frame.sample_rate || audioRate;
+      refreshRoute();
+    } else if (type === 'you') {
+      // 她听到的:用来核对"收音到底对不对"
+      var meta = [];
+      if (typeof frame.secs === 'number') { meta.push('识别 ' + frame.secs + ' 秒'); }
+      if (typeof frame.level_dbfs === 'number') { meta.push(frame.level_dbfs.toFixed(1) + ' dBFS'); }
+      if (typeof frame.asr_ms === 'number') { meta.push('ASR ' + frame.asr_ms + ' ms'); }
+      el.heard.textContent = '她听到的:' + (frame.text || '(空)') + (meta.length ? '(' + meta.join(' · ') + ')' : '');
+      said('you', frame.text);
+    } else if (type === 'her') {
+      said('her', frame.text);
+    } else if (type === 'audio_begin') {
+      audioRate = frame.sample_rate || 24000;
+      audioSegments = 0;
+      inAudioSegment = true;
+      // 边说边播:从现在开始,每收到一段就往后排一段
+      nextPlayTime = 0;
+      logLine('  开始收语音 ' + audioRate + ' Hz / ' + (frame.channels || 1) + ' 声道');
+      el['f-audio'].textContent = '接收中…';
+    } else if (type === 'audio_end') {
+      inAudioSegment = false;
+      var row = frame.row || {};
+      if (typeof row.first_audio_ms === 'number') { el['s-first'].textContent = row.first_audio_ms + ' ms'; }
+      if (typeof row.audio_secs === 'number') { el['s-audio'].textContent = row.audio_secs + ' 秒'; }
+      logLine('  语音结束 reason=' + (frame.reason || '?') + ',共 ' + audioSegments + ' 段');
+      el['f-audio'].textContent = audioSegments > 0 ? '已播 ' + audioSegments + ' 段' : '空闲';
+    } else if (type === 'error') {
+      setStatus('家里报错: ' + frame.message, 'bad');
+    }
+  }
+
+  /** 二进制帧:audio_begin 与 audio_end 之间是裸 PCM16。 */
+  function handleBinaryFrame(buffer) {
+    if (!inAudioSegment) {
+      logLine('← (二进制 ' + buffer.byteLength + ' 字节,不在 audio_begin/audio_end 之间,忽略)');
+      return;
+    }
+    playPcm(buffer);
+  }
+
+  // ---------------------------------------------------------------- 播放
+  /** 整个页面只建一个 AudioContext,并保证它处在 running(自动播放策略)。 */
+  function unlockAudio() {
+    if (!audioContext) {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) {
+        logLine('这台设备的 WebView 没有 Web Audio,播不了语音');
+        el['f-audio'].textContent = '不支持 Web Audio';
+        return null;
+      }
+      audioContext = new Ctor();
+      logLine('AudioContext 已创建(' + audioContext.sampleRate + ' Hz)');
+    }
+    if (audioContext.state === 'suspended') {
+      audioContext.resume();
+    }
+    el['f-audio'].textContent = audioContext.state === 'running' ? '空闲' : '待触摸解锁';
+    return audioContext;
+  }
+
+  /**
+   * 播一段 PCM16LE:解成 Float32 → AudioBuffer → 排到上一段的后面。
+   * 不攒到最后:nextPlayTime 是游标,每段首尾相接,边收边播。
+   */
+  function playPcm(buffer) {
+    var ctx = unlockAudio();
+    if (!ctx) { return; }
+    var samples = Math.floor(buffer.byteLength / 2);
+    if (samples === 0) { return; }
+
+    var view = new DataView(buffer);
+    var audioBuffer = ctx.createBuffer(1, samples, audioRate);
+    var channel = audioBuffer.getChannelData(0);
+    for (var i = 0; i < samples; i++) {
+      channel[i] = view.getInt16(i * 2, true) / 32768;
+    }
+
+    var source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    var startAt = Math.max(ctx.currentTime + 0.02, nextPlayTime);
+    source.start(startAt);
+    nextPlayTime = startAt + audioBuffer.duration;
+
+    audioSegments += 1;
+    logLine('  播放第 ' + audioSegments + ' 段:' + samples + ' 采样 / ' + (buffer.byteLength / 1024).toFixed(1) + ' KB');
+    el['f-audio'].textContent = '队列中 ' + audioSegments + ' 段';
+  }
+
+  // ---------------------------------------------------------------- 录音
+  var recording = false;
+  var chunks = [];
+  var recordedBytes = 0;
+  var recordStartedAt = 0;
+  var routeTimer = null;
+  var sendTimer = null;
+
+  /** 按住说话:开原生录音(16 kHz 单声道,强制走蓝牙耳机麦)。 */
+  function startTalking() {
+    if (recording) { return; }
+    if (!bridgeReady) {
+      setHint('按住说话:在浏览器里打开没有原生桥,录不了音');
+      logLine('没有原生桥,startRecording 不可用');
+      return;
+    }
+    if (!wsOpen()) {
+      // 允许录,但要说清楚发不出去(家里那侧没连上时最常见的困惑)
+      setHint('还没连上家里,这段录音会发不出去');
+      logLine('未连接就开始录音,提醒:松开后无法发送');
+    }
+    // 按下这一瞬间的路由:和"录音中"的路由一对比就知道麦有没有被切过去
+    logRoute('按下前');
+    var started = native('startRecording', []);
+    if (started !== true) {
+      // 真正的原因由原生通过 onRecordingStopped 送过来(一两百毫秒后到),这里只兜底
+      logLine('startRecording 返回 ' + started + ',等原生的失败原因');
+      refreshRoute();
+      // 只有在确实缺麦克风权限时才弹权限框:没有可用耳机不是权限问题
+      if (!lastRoute || lastRoute.audioPermission !== 'granted') {
+        native('requestAudioPermission', []);
+      }
+      setHint('录音没起来:看上面「耳机诊断」里的那行提示');
+      return;
+    }
+    chunks = [];
+    recordedBytes = 0;
+    recordStartedAt = Date.now();
+    recording = true;
+    el.ptt.className = 'big live';
+    el.ptt.textContent = '松开结束';
+    el.recordText.textContent = '录音中…';
+    logLine('开始录音(16 kHz 单声道 PCM16)');
+    refreshRoute();
+    // 录音时每秒刷一次路由:这是"麦有没有走耳机"最直接的现场证据
+    routeTimer = setInterval(function () {
+      refreshRoute();
+      updateRecordText();
+    }, 1000);
+  }
+
+  /** 松开:停录音,等最后一小块 PCM 到齐,再封 WAV 发出去。 */
+  function stopTalking(autoReason) {
+    if (!recording) { return; }
+    // 先取"录音中"的真实路由:一停录音,AudioRecord 就没了,routedDevice 也就读不到了
+    var during = fetchRoute();
+    recording = false;
+    native('stopRecording', []);
+    if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
+    el.ptt.className = 'big';
+    el.ptt.textContent = '按住说话';
+    el.recordText.textContent = '已停(' + (recordedBytes / 1024).toFixed(1) + ' KB)';
+    if (autoReason) { logLine('录音被自动停止: ' + autoReason); }
+    if (during) {
+      renderRoute(during);
+      showLastRecording(during);
+      logLine('本次录音输入=' + (during.routedDevice || '无') + '[' + (during.routedDeviceType || '-') + ']'
+        + ' 档位:' + (during.lastAttempt || '-'));
+    }
+    refreshRoute();
+    // 等 150 ms:最后一块(不足 100 ms 的尾巴)的 onChunk 是 post 过来的,先让它落地
+    if (sendTimer) { clearTimeout(sendTimer); }
+    sendTimer = setTimeout(function () {
+      sendTimer = null;
+      sendUtterance();
+    }, 150);
+  }
+
+  function updateRecordText() {
+    if (!recording) { return; }
+    var secs = ((Date.now() - recordStartedAt) / 1000).toFixed(1);
+    el.recordText.textContent = '录音中 ' + secs + ' 秒 / ' + (recordedBytes / 1024).toFixed(1) + ' KB';
+  }
+
+  /** 把这一轮攒下的 PCM 封成 WAV,按协议发出去。 */
+  function sendUtterance() {
+    if (!pure) { logLine('pure.js 没加载,无法封装 WAV'); return; }
+    if (recordedBytes === 0) {
+      setHint('这一段没录到数据(权限被拒,或耳机麦没起来),细节见日志');
+      logLine('录音共 0 字节,不发送');
+      return;
+    }
+    var pcm = pure.mergeChunks(chunks);
+    var frame = pure.buildUtteranceFrame(pcm, UPLINK_RATE);
+    el['s-up'].textContent = frame.secs + ' 秒 / ' + (pcm.length / 1024).toFixed(1) + ' KB';
+
+    if (!wsOpen()) {
+      logLine('未连接,这段 ' + frame.secs + ' 秒录音丢弃');
+      setHint('没连上家里,刚才那段没发出去');
+      return;
+    }
+    socket.send(JSON.stringify(frame.json));
+    socket.send(frame.binary);
+    logLine('→ utterance + wav ' + frame.binary.byteLength + ' 字节(含 44 字节头)');
+  }
+
+  // ---------------------------------------------------------------- 拍照
+  function takePhoto() {
+    if (!bridgeReady) {
+      setHint('拍照:在浏览器里打开没有原生桥');
+      return;
+    }
+    var started = native('capturePhoto', ['看看这个']);
+    if (started !== true) {
+      logLine('capturePhoto 返回 ' + started + ',申请相机权限');
+      native('requestCameraPermission', []);
+      setHint('拍照:需要相机权限,在系统弹窗里允许后再点一次');
+      return;
+    }
+    logLine('相机已拉起,拍完自动缩放 + 上传');
+    setHint('拍照中…拍完会自动缩放(长边 1280)并上传');
+  }
+
+  // ---------------------------------------------------------------- 路由显示
+  /** 最近一次 getAudioRoute() 的结果,判断"该不该弹权限"时要用。 */
+  var lastRoute = null;
+
+  /** 把一整份路由 JSON 渲染成诊断清单 + 一句结论(pure.js 负责判断,方便单测)。 */
+  function renderRoute(route) {
+    lastRoute = route;
+    if (!pure) { return; }
+    var view = pure.summarizeRoute(route);
+    el['r-verdict'].textContent = view.verdict.text;
+    el['r-verdict'].className = 'verdict ' + (view.verdict.level || 'warn');
+
+    var container = el['r-rows'];
+    container.textContent = '';
+    for (var i = 0; i < view.rows.length; i++) {
+      var row = view.rows[i];
+      var line = document.createElement('div');
+      if (row.level) { line.className = row.level; }
+      var label = document.createElement('span');
+      label.textContent = row.label;
+      var value = document.createElement('span');
+      value.textContent = row.value;
+      line.appendChild(label);
+      line.appendChild(value);
+      container.appendChild(line);
+    }
+  }
+
+  /** 拉一次原生路由并渲染。进页面、点刷新、录音中每秒、失败后都会调。 */
+  function refreshRoute() {
+    var route = fetchRoute();
+    if (!route) {
+      el['r-verdict'].textContent = bridgeReady
+        ? '读不到路由(桥调用失败,详见帧日志)'
+        : '没有原生桥:在浏览器里打开时看不到音频路由';
+      el['r-verdict'].className = 'verdict bad';
+      return null;
+    }
+    renderRoute(route);
+    return route;
+  }
+
+  /** 取一次路由对象(拿不到返回 null)。 */
+  function fetchRoute() {
+    var json = native('getAudioRoute', []);
+    if (!json) { return null; }
+    try {
+      return JSON.parse(json);
+    } catch (error) {
+      logLine('getAudioRoute 不是合法 JSON: ' + json);
+      return null;
+    }
+  }
+
+  /** 把路由压成一行短日志,写进帧日志:按下前后各来一次,差异一眼能看出来。 */
+  function logRoute(tag) {
+    var route = native('getAudioRoute', []);
+    if (!route) { return; }
+    try {
+      var parsed = JSON.parse(route);
+      lastRoute = parsed;
+      logLine('路由[' + tag + '] 方式=' + (parsed.scoMode || 'auto')
+        + ' mode=' + parsed.mode
+        + ' sco=' + (parsed.scoOn ? 'on' : 'off')
+        + ' 通信设备=' + (parsed.communicationDevice || '无')
+        + ' 实际输入=' + (parsed.routedDevice || '无')
+        + '[' + (parsed.routedDeviceType || '-') + ']'
+        + ' 可用通信=' + ((parsed.availableCommunication || []).join('/') || '无')
+        + ' 已连耳机=' + ((parsed.connectedHeadsets || []).join('/') || '无'));
+    } catch (error) {
+      logLine('路由[' + tag + '] 解析失败');
+    }
+  }
+
+  /** 在卡片上写一行"这次录音实际用了什么" —— 松手之后最需要看到的就是它。 */
+  function showLastRecording(route) {
+    if (!route) { return; }
+    var device = route.routedDevice || '(读不到)';
+    var type = route.routedDeviceType || '-';
+    var attempt = route.lastAttempt || '';
+    el['r-last'].textContent = '本次录音输入设备:' + device + ' [' + type + ']'
+      + (attempt ? ' · 档位:' + attempt : '');
+    el['r-last'].style.color = pure && pure.looksLikeHeadset(device) ? 'var(--ok)' : 'var(--warn)';
+  }
+
+  /**
+   * 复制文本到剪贴板。
+   *
+   * file:// 页面在 Chrome/WebView 里算安全上下文,理论上 navigator.clipboard 可用,
+   * 但真机上被拒的情况不少,所以再兜一层 execCommand。
+   * @param {string} text 要复制的文本。
+   * @param {function(boolean)} done 结果回调。
+   */
+  function copyText(text, done) {
+    var fallback = function () {
+      var ok = false;
+      try {
+        var area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', 'readonly');
+        area.style.position = 'fixed';
+        area.style.top = '-1000px';
+        document.body.appendChild(area);
+        area.select();
+        area.setSelectionRange(0, text.length);
+        ok = document.execCommand('copy');
+        document.body.removeChild(area);
+      } catch (error) {
+        ok = false;
+      }
+      done(ok);
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { done(true); }, fallback);
+        return;
+      }
+    } catch (error) {
+      // 落到兜底
+    }
+    fallback();
+  }
+
+  // ---------------------------------------------------------------- 原生回调
+  // 同时挂到 window.QingyuNative(原生优先调这里)与 window.QingyuHooks(兜底)。
+  // 万一 WebView 不允许给注入对象加属性,回调也不会静默丢失。
+  var hooks = {
+    onAudio: function (base64Pcm) {
+      // 松开之后那一小块尾巴也会到这里:一律收下,别丢字
+      if (!pure) { return; }
+      var bytes = pure.base64ToBytes(base64Pcm);
+      chunks.push(bytes);
+      recordedBytes += bytes.length;
+      updateRecordText();
+    },
+    onLevel: function (dbfs) {
+      lastLevel = dbfs;
+      el.levelBar.style.width = (pure ? pure.levelToRatio(dbfs) * 100 : 0).toFixed(0) + '%';
+      el.levelText.textContent = dbfs.toFixed(1) + ' dBFS';
+      el['s-level'].textContent = dbfs.toFixed(1) + ' dBFS';
+    },
+    onRecordingStopped: function (reason) {
+      // 三种来源:30 秒到顶(autoStop)、录音根本没能开始(失败原因)、一般收尾
+      if (reason === 'timeout') {
+        setHint('到了 30 秒上限,已自动停止并发送');
+        stopTalking(reason);
+        return;
+      }
+      if (recording) {
+        stopTalking(reason);
+        return;
+      }
+      // 还没开始就失败:把可操作的原因直接摆在页面上,别只留在日志里
+      logLine('录音未能开始:' + reason);
+      el['r-verdict'].textContent = reason;
+      el['r-verdict'].className = 'verdict bad';
+      setHint(reason);
+      refreshRoute();
+    },
+    onRoute: function (routeJson) {
+      // 原生在 SCO 建立后主动报一次路由:这时才能看到 routedDevice 是不是耳机
+      try {
+        var route = JSON.parse(routeJson);
+        renderRoute(route);
+        logLine('路由[原生回报] 实际输入=' + (route.routedDevice || '无')
+          + '[' + (route.routedDeviceType || '-') + ']'
+          + ' sco=' + (route.scoOn ? 'on' : 'off')
+          + ' 档位=' + (route.lastAttempt || '-'));
+      } catch (error) {
+        logLine('onRoute 收到非 JSON: ' + routeJson);
+      }
+    },
+    onRouteAttempt: function (text) {
+      // 三档路由尝试的实测结果,一行一条:现场一眼就能看出哪档通、哪档不通
+      logLine('路由尝试 → ' + text);
+    },
+    onPhoto: function (base64Jpeg, text) {
+      if (!base64Jpeg) {
+        logLine('拍照取消或失败(空 base64)');
+        setHint('拍照已取消(或相机没给出照片)');
+        return;
+      }
+      if (!pure) { logLine('pure.js 没加载,无法组 image 帧'); return; }
+      var bytes = pure.base64ToBytes(base64Jpeg);
+      var frame = pure.buildImageFrame(bytes, text || '看看这个');
+      var kb = (frame.binary.byteLength / 1024).toFixed(1);
+      if (!wsOpen()) {
+        logLine('未连接,照片丢弃(' + kb + ' KB)');
+        setHint('没连上家里,照片没发出去(' + kb + ' KB)');
+        return;
+      }
+      socket.send(JSON.stringify(frame.json));
+      socket.send(frame.binary);
+      logLine('→ image + jpeg ' + kb + ' KB');
+      said('you', '[照片 ' + kb + ' KB] ' + frame.json.text);
+      setHint('照片已发出(' + kb + ' KB)');
+    },
+    onPermission: function (name, granted) {
+      var short = String(name).replace('android.permission.', '');
+      logLine('权限 ' + short + ' → ' + (granted ? '已允许' : '被拒'));
+      if (short === 'RECORD_AUDIO') {
+        setHint(granted ? '麦克风权限已允许,现在可以按住说话' : '麦克风权限被拒,按住说话录不了音');
+      }
+      if (short === 'BLUETOOTH_CONNECT') {
+        setHint(granted
+          ? '『附近的设备』权限已允许,现在能枚举蓝牙耳机了'
+          : '『附近的设备』权限被拒:去 设置 → 应用 → 轻语 → 权限 里打开「附近的设备」');
+      }
+      if (short === 'CAMERA') {
+        setHint(granted ? '相机权限已允许,再点一次拍照' : '相机权限被拒,拍不了照');
+      }
+      refreshInfo();
+      // 权限变化会直接影响"能不能看到耳机",所以顺手把路由刷一遍
+      refreshRoute();
+    }
+  };
+  window.QingyuHooks = hooks;
+  if (bridgeReady) {
+    try {
+      for (var key in hooks) {
+        if (Object.prototype.hasOwnProperty.call(hooks, key)) { window.QingyuNative[key] = hooks[key]; }
+      }
+    } catch (error) {
+      logLine('把回调挂到桥对象失败,将走 window.QingyuHooks: ' + error);
+    }
+  }
+
+  // ---------------------------------------------------------------- 其它按钮
+  el.ptt.addEventListener('pointerdown', function (event) {
+    event.preventDefault();
+    startTalking();
+  });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (name) {
+    el.ptt.addEventListener(name, function () { stopTalking(); });
+  });
+  // 手指按在按钮外再松开也要收尾,否则会一直录到 30 秒上限
+  window.addEventListener('pointerup', function () { stopTalking(); });
+
+  el.camera.addEventListener('click', takePhoto);
+  el.refreshRoute.addEventListener('click', function () {
+    refreshRoute();
+    logRoute('手动刷新');
+  });
+  // Android 12+ 没有『附近的设备』权限就枚举不到蓝牙音频设备 —— 这正是"扫不到耳机"的常见原因
+  el.requestBt.addEventListener('click', function () {
+    logLine('申请蓝牙相关权限(录音 + 附近的设备 + 扫描)');
+    native('requestAudioPermission', []);
+    native('requestBtPermission', []);
+  });
+
+  // SCO 方式:现场就在这两条路之间切着试,哪条通一目了然
+  el.scoMode.addEventListener('change', function () {
+    var effective = native('setScoMode', [el.scoMode.value]);
+    logLine('SCO 方式改为 ' + el.scoMode.value + '(实际生效 ' + effective + ')');
+    try { localStorage.setItem('qingyu.scoMode', String(effective || el.scoMode.value)); } catch (error) { /* 无所谓 */ }
+    setHint('SCO 方式已切到「' + (pure ? pure.scoModeText(effective) : effective) + '」,按住说话试一次,看卡片上「本次录音输入设备」');
+    refreshRoute();
+  });
+
+  el.allowTier3.addEventListener('change', function () {
+    var effective = native('setAllowPreferredDevice', [el.allowTier3.checked]);
+    logLine('档3(首选设备)开关 → ' + effective);
+  });
+
+  // 复制诊断:远程排障全靠它 —— 全文同时写进帧日志,logcat 里也能捞到
+  el.copyDiag.addEventListener('click', function () {
+    var route = fetchRoute();
+    if (!route || !route.diagnostics) {
+      setHint('拿不到诊断文本(原生桥不可用?)');
+      return;
+    }
+    logLine('诊断全文:' + String.fromCharCode(10) + route.diagnostics);
+    copyText(route.diagnostics, function (ok) {
+      setHint(ok
+        ? '诊断已复制到剪贴板,直接粘给对方即可;全文也写进了下面的帧日志'
+        : '复制失败:诊断全文已写进下面的帧日志,长按选中复制即可');
+      logLine('复制诊断 → ' + (ok ? '成功' : '失败(已回退到日志)'));
+    });
+  });
+
+  // SCO 试验:不录音、不用按住说话,直接看蓝牙通话链路能不能建起来
+  el.probeSco.addEventListener('click', function () {
+    if (!bridgeReady) {
+      setHint('没有原生桥,做不了 SCO 试验');
+      return;
+    }
+    setHint('正在做 SCO 试验,约 3 秒,请稍等');
+    logLine('开始 SCO 试验(不录音,约 3 秒)');
+    var json = native('probeSco', []);
+    if (!json) {
+      setHint('SCO 试验失败:桥调用没有返回');
+      return;
+    }
+    var result;
+    try {
+      result = JSON.parse(json);
+    } catch (error) {
+      logLine('probeSco 返回非 JSON: ' + json);
+      setHint('SCO 试验返回异常,详见帧日志');
+      return;
+    }
+    var view = pure ? pure.probeSummary(result) : null;
+    el['r-probe'].textContent = result.text || result.conclusion || '(试验没有返回时间线)';
+    if (view) {
+      el['r-verdict'].textContent = view.text;
+      el['r-verdict'].className = 'verdict ' + view.level;
+      logLine('SCO 试验结论(' + view.stepCount + ' 步):' + view.text);
+    }
+    setHint(view ? view.text : 'SCO 试验完成,详见诊断卡片');
+    refreshRoute();
+  });
+
+  el.sendText.addEventListener('click', function () {
+    var text = el.textInput.value.trim();
+    if (!text) { return; }
+    if (sendJson({ type: 'text', text: text })) {
+      said('you', text);
+      el.textInput.value = '';
+    }
+  });
+
+  el.ping.addEventListener('click', function () { sendJson({ type: 'ping' }); });
+  el.clearLog.addEventListener('click', function () { el.log.textContent = ''; });
+
+  el.connect.addEventListener('click', function () { connect(); });
+  el.disconnect.addEventListener('click', function () { disconnect(false); });
+  el.address.addEventListener('change', function () { saveConfig(false); });
+  el.token.addEventListener('change', function () { saveConfig(false); });
+
+  // 地址预设:换手机时不用去记那串域名/端口
+  el.presetTailscale.addEventListener('click', function () {
+    el.address.value = (pure && pure.TAILSCALE_URL) || 'wss://laptop-u3hj61a7.tail35209a.ts.net:8443/';
+    el.presetHint.textContent = '已填 Tailscale 地址:手机装了 Tailscale 并登录同一账号后,点「连接」即可(令牌可留空)。';
+    saveConfig(true);
+    logLine('地址预设 → 家里(Tailscale): ' + el.address.value);
+  });
+
+  el.presetLan.addEventListener('click', function () {
+    var wifiIp = bridgeReady ? native('getWifiIp', []) : '';
+    var preset = pure ? pure.buildLanPreset(wifiIp) : { url: 'ws://192.168.1.100:6201/', hint: '把 IP 换成电脑的局域网地址' };
+    el.address.value = preset.url;
+    el.presetHint.textContent = preset.hint;
+    saveConfig(true);
+    logLine('地址预设 → 同一个 WiFi: ' + preset.url + '(手机 IP 读作 ' + (wifiIp || '未知') + ')');
+  });
+
+  el.guideClose.addEventListener('click', function () {
+    el.guideCard.style.display = 'none';
+    try { localStorage.setItem('qingyu.guideDismissed', '1'); } catch (error) { /* 无所谓 */ }
+    logLine('已关闭首次使用引导');
+  });
+
+  // 首次触摸时解锁 AudioContext(自动播放策略),别等收到语音才建
+  document.addEventListener('pointerdown', function () { unlockAudio(); }, { passive: true });
+
+  // 回到前台立刻重连 + 重新握手:系统在后台时会掐掉连接,别等退避计时器慢慢来
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible') { return; }
+    if (!wantConnected) { return; }
+    logLine('回到前台(visibility=' + document.visibilityState + ')');
+    if (wsOpen()) {
+      // 还连着也没坏处:补一次 hello,确认家里那侧还认这个连接
+      sendJson({ type: 'hello' });
+      refreshRoute();
+      return;
+    }
+    cancelReconnect();
+    logLine('回到前台发现连接已断,立刻重连');
+    connect();
+  });
+  window.addEventListener('pageshow', function () {
+    if (wantConnected && !wsOpen()) {
+      cancelReconnect();
+      connect();
+    }
+  });
+
+  window.addEventListener('error', function (event) {
+    logLine('页面错误: ' + event.message + ' @' + event.lineno);
+  });
+
+  // ---------------------------------------------------------------- 启动
+  function refreshInfo() {
+    var info = native('getInfo', []);
+    if (!info) {
+      el['f-bridge'].textContent = bridgeReady ? '可用(读不到信息)' : '不可用(用浏览器打开了?)';
+      el['f-version'].textContent = '—(无原生桥)';
+      el['f-perm'].textContent = '—(无原生桥)';
+      el['f-hw'].textContent = '—(无原生桥)';
+      return;
+    }
+    try {
+      var parsed = JSON.parse(info);
+      el['f-bridge'].textContent = '可用 (' + (parsed.device || '未知机型') + ')';
+      el['f-version'].textContent = parsed.app_version + ' / Android ' + parsed.android_version + ' (SDK ' + parsed.sdkInt + ')';
+      el.appVersion.textContent = parsed.app_version || '?';
+      el['f-perm'].textContent = '录音 ' + parsed.recordPermission + ' · 相机 ' + parsed.cameraPermission;
+      el['f-hw'].textContent = (parsed.hasMicrophone ? '麦克风有' : '麦克风无')
+        + ' · ' + (parsed.hasCamera ? '相机有' : '相机无')
+        + ' · 蓝牙 ' + (parsed.bluetoothScoSupported ? '有' : '无')
+        + ' / SCO 非通话可用 ' + (parsed.scoOffCall ? '是' : '否');
+      // 华为/鸿蒙要额外放后台,否则熄屏久了连接还是会被掐
+      var looksHuawei = /huawei|honor|harmony/i.test(String(parsed.device || ''));
+      el.batteryHint.style.display = looksHuawei ? 'block' : 'none';
+      logLine('设备信息 ' + info);
+    } catch (error) {
+      logLine('getInfo 返回的不是 JSON: ' + info);
+    }
+  }
+
+  /**
+   * 进来先判断本机到底给不给蓝牙麦克风;不给就自动切到手机麦,并把原因写清楚。
+   * 只有当前是默认的 auto 方式才会自动改 —— 用户手动选过实验方式就不插手。
+   */
+  function autoDowngradeIfNeeded(route) {
+    if (!route || !pure) { return false; }
+    var mode = native('getScoMode', []);
+    if (!pure.shouldAutoDowngrade(route, mode)) { return false; }
+    var effective = native('setScoMode', ['phone']);
+    el.scoMode.value = effective || 'phone';
+    try { localStorage.setItem('qingyu.scoMode', String(effective || 'phone')); } catch (error) { /* 无所谓 */ }
+    var notice = pure.autoDowngradeNotice(route);
+    el['r-verdict'].textContent = notice;
+    el['r-verdict'].className = 'verdict warn';
+    setHint(notice);
+    logLine('自动降级:SCO 方式 ' + mode + ' → ' + effective + ';原因:本机拿不到蓝牙输入(scoOn/可用通信设备/输入设备里都没有蓝牙项)');
+    return true;
+  }
+
+  (function boot() {
+    var def = loadConfig();
+    logLine('启动。默认地址 ' + def, true);
+    if (!pure) {
+      logLine('pure.js 没加载:WAV 封装与 base64 都不可用(检查 assets 是否完整)');
+    }
+    // 把上次选的 SCO 方式同步回原生(原生自己也有存,这里保证两边一致)
+    var savedMode = null;
+    try { savedMode = localStorage.getItem('qingyu.scoMode'); } catch (error) { savedMode = null; }
+    var nativeMode = native('getScoMode', []);
+    var effMode = native('setScoMode', [savedMode || nativeMode || 'auto']);
+    el.scoMode.value = effMode || 'auto';
+    if (effMode === 'phone') {
+      logLine('当前方式是「只用手机麦」(耳机只放声音)');
+    }
+    var allowTier3 = native('getAllowPreferredDevice', []);
+    el.allowTier3.checked = allowTier3 === true;
+    refreshInfo();
+    // 一进页面就把路由查出来:用户不用先点按钮就能看到耳机状态
+    var initialRoute = refreshRoute();
+    logRoute('进入页面');
+    // 拿不到蓝牙输入就自动降级,别让用户自己去猜该选哪个
+    if (!autoDowngradeIfNeeded(initialRoute)) {
+      logLine('本机蓝牙输入可用,保持当前 SCO 方式');
+    }
+    // 第一次用(没填过地址)给三步引导,免得拿到 APK 的人不知道从哪下手
+    var dismissed = false;
+    try { dismissed = localStorage.getItem('qingyu.guideDismissed') === '1'; } catch (error) { dismissed = false; }
+    var savedAddress = readSavedAddress();
+    var showGuide = pure ? pure.shouldShowGuide(savedAddress, dismissed) : !savedAddress;
+    el.guideCard.style.display = showGuide ? 'block' : 'none';
+    if (showGuide) { logLine('首次使用:显示三步引导'); }
+    // 上次做过 SCO 试验就把时间线摆出来,省得再点一次
+    if (initialRoute && initialRoute.lastProbe) {
+      el['r-probe'].textContent = initialRoute.lastProbe;
+      logLine('显示上次的 SCO 试验结果');
+    }
+    updateAddressFact();
+  })();
+})();
+</script>
+</body>
+</html>

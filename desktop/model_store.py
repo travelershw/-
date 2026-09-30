@@ -20,40 +20,71 @@ MODELS = paths.BASE / "models"
 TIMEOUT_SECONDS = 600
 
 
-def download(url: str, target: Path, progress=None) -> int:  # noqa: ANN001 - 可选回调
-    """Download one file, verify it is complete, and clean up on failure.
+def download(url: str, target: Path, progress=None, *, attempts: int = 6) -> int:  # noqa: ANN001
+    """Download one file with resume + retries, verifying it is complete.
+
+    为什么要断点续传（2026-09-25 实测）：Kokoro 的 `model.onnx` 有 **310 MB**，
+    过这条链路一次拉不完——两个源分别在 92 MB / 122 MB 处被切断。
+    以前每次重试都从 0 开始，等于永远在拉前 100 MB；现在带 ``Range`` 从断点继续。
+
+    完整性仍然照旧核对：拿实际字节数和 ``Content-Length`` / ``Content-Range`` 对账，
+    对不上就继续续传，彻底放弃时才删掉半成品——**绝不留一个坏模型**。
 
     Args:
         url: Source URL.
         target: Destination path.
         progress: Optional ``callable(done, total)``.
+        attempts: How many resume attempts before giving up.
 
     Returns:
         Bytes written.
 
     Raises:
-        OSError: On network failure, or when the download was cut short.
+        OSError: When every attempt failed.
     """
-    try:
-        with urllib.request.urlopen(
-            urllib.request.Request(url), timeout=TIMEOUT_SECONDS
-        ) as response:
-            total = int(response.headers.get("Content-Length") or 0)
-            done = 0
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("wb") as out:
-                while chunk := response.read(1 << 20):
-                    out.write(chunk)
-                    done += len(chunk)
-                    if progress is not None:
-                        progress(done, total)
-    except (urllib.error.URLError, OSError) as exc:
-        target.unlink(missing_ok=True)
-        raise OSError(f"{type(exc).__name__}: {exc}") from exc
-    if total and done < total:
-        target.unlink(missing_ok=True)
-        raise OSError(f"下载中断（{done}/{total} 字节），已删除不完整的文件")
-    return done
+    expected = 0
+    last_error: OSError | None = None
+    for _attempt in range(max(1, attempts)):
+        done = target.stat().st_size if target.exists() else 0
+        request = urllib.request.Request(url)
+        mode = "wb"
+        if done:
+            request.add_header("Range", f"bytes={done}-")
+            mode = "ab"
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+                status = getattr(response, "status", 200)
+                if status == 206:
+                    content_range = response.headers.get("Content-Range") or ""
+                    total = (
+                        int(content_range.rsplit("/", 1)[-1])
+                        if "/" in content_range
+                        else expected
+                    )
+                else:
+                    # 服务端不支持续传（或本来就是第一次）：从头来
+                    total = int(response.headers.get("Content-Length") or 0)
+                    if done:
+                        target.unlink(missing_ok=True)
+                        done, mode = 0, "wb"
+                expected = total or expected
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open(mode) as out:
+                    while chunk := response.read(1 << 20):
+                        out.write(chunk)
+                        done += len(chunk)
+                        if progress is not None:
+                            progress(done, total or expected)
+        except (urllib.error.URLError, OSError) as exc:
+            last_error = OSError(f"{type(exc).__name__}: {exc}")
+            continue
+        if expected and done >= expected:
+            return done
+        if not expected and done:  # 服务端没给长度：能下多少算多少
+            return done
+        last_error = OSError(f"下载中断（{done}/{expected} 字节）")
+    target.unlink(missing_ok=True)
+    raise OSError(f"下载失败（试了 {attempts} 次）：{last_error}")
 
 
 def fetch_first(sources, target: Path, progress=None) -> tuple[str, int]:  # noqa: ANN001

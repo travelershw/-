@@ -2,10 +2,11 @@
 
 一个以 AstrBot 为载体的群聊陪伴机器人及其桌面桌宠、历史实现代码的公开发布仓库。
 
-“轻语”由三部分组成：
+“轻语”由四部分组成：
 
 - **桌面桌宠**（`desktop/`）：一个可独立运行的桌面小宠物，也通过本机 WebSocket 接到 AstrBot，让她的记忆、好感度、心情与 QQ 群里的“同一个人”完全打通。带一组**手动触发**的“传感器”：看屏幕、看摄像头、本机状态（闲置/锁屏/前台程序名）、天气/空气质量/日出日落（唯一会联网查的一项，位置由你自己填），以及**语音对话**（点一次听一句，或打开“对话模式”连续听；识别默认在本机做，音频不出机器）。详见 [docs/PRIVACY.md](docs/PRIVACY.md)。
-- **AstrBot 自定义插件**（`plugins/`）：9 个自定义插件，承载轻语 Agent 的核心逻辑（人格、好感、群味、知识库、表情包、看门狗等）。
+- **手机端**（`phone/`）：Android 客户端，**手机只负责听和说，她的脑子留在家里那台电脑上**。手机上录音/播放/拍照，识别、人格、记忆与语音合成都在电脑侧完成；同一 WiFi 直连，人在外地走 Tailscale（`desktop/phone_bridge.py` 是电脑侧的中转）。详见 [phone/README.md](phone/README.md)。
+- **AstrBot 自定义插件**（`plugins/`）：10 个自定义插件，承载轻语 Agent 的核心逻辑（人格、好感、群味、知识库、表情包、看门狗、眼镜/手机通道等）。
 - **历史实现**（`legacy-cpp/`）：早期用 C++ 写的机器人原型（直连 DeepSeek / NapCat 的 AI 源码），作为历史实现保留。
 
 > 本仓库发布的是**完整工程源码与历史实现**，**不是**任何机器的运行备份。仓库内不含运行数据、外部图片、密钥等私密内容（详见 [docs/PRIVACY.md](docs/PRIVACY.md)）。
@@ -22,8 +23,11 @@ qingyu-public/
 │   ├── INSTALL.md                # 安装 / 构建 / 配置说明
 │   └── PRIVACY.md                # 隐私与发布范围说明
 ├── desktop/                      # 桌宠 Python 源码（无立绘，程序 fallback 绘制）
+│                                 #   （含手机中转 phone_bridge.py 与设备模拟器 glasses_sim.py）
 │   └── requirements.txt
-├── plugins/                      # 9 个自定义 AstrBot 插件
+├── phone/                        # Android 手机端源码（生成式 Gradle 工程 + 零依赖构建脚本）
+│                                 #   （android/、vendor/、dist/ 是生成物/二进制/打包产物，不进仓库）
+├── plugins/                      # 自定义 AstrBot 插件
 │                                 #   （看门狗插件内置 watchdog_runtime.py 运行逻辑）
 ├── legacy-cpp/                   # C++ AI 源码（CMakeLists、THIRD_PARTY_LICENSES.txt 等）
 └── vendor/
@@ -31,13 +35,14 @@ qingyu-public/
                                   #   （排除所有用户 data/deps/env/build/git/私密文档/migration_tools）
 ```
 
-### 9 个插件
+### 插件
 
 | 插件目录 | 作用 |
 | --- | --- |
 | `qingyu_core` | 轻语 Agent 核心：群味管长度、好感度管语气、引用/叫名字、记忆、周报 |
 | `qingyu_affection` | 好感度系统：按说话语气在 0~100 间微调好感度，并按好感度切换回答语气 |
 | `desktop_pet` | 桌面桌宠通道：本机 WebSocket 平台适配器，桌宠说的话算用户本人的消息（记忆/好感/心情与 QQ 打通） |
+| `glasses` | 眼镜/手机通道：给自带设备用的 WebSocket 平台适配器（文本 / 语音 / 图片，下行支持**流式** PCM 音频） |
 | `group_knowledge` | 群聊知识库：`knowledge_lookup` 检索工具 + 群聊 `/知识库` 指令 |
 | `meme_search` | 按关键词联网搜表情包并发送，给轻语提供 `send_meme` 工具 |
 | `deepseek_search` | DeepSeek 原生 `web_search` 联网检索工具 |
@@ -48,6 +53,7 @@ qingyu-public/
 ## 快速开始
 
 - **只想跑桌宠**：看 [docs/INSTALL.md](docs/INSTALL.md) 的“桌宠”一节（`python pet.py`）。
+- **想装手机端 App**：装仓库 Release 里的 APK；想自己构建看 [phone/README.md](phone/README.md)。
 - **想跑完整的群聊机器人**：需要 AstrBot 4.28.x + `plugins/` 下插件，见 [docs/INSTALL.md](docs/INSTALL.md)。
 - **构建历史 C++ 实现**：见 [docs/INSTALL.md](docs/INSTALL.md) 的“legacy-cpp”一节。
 

@@ -31,7 +31,9 @@ _COOLDOWN_TRACK_LIMIT = 512
 #   webchat      面板控制台（原来就豁免）
 #   desktop_pet  本机桌面桌宠（打字聊天 + 语音对话）——你说一句她答一句，
 #                中间隔几秒是正常的，冷却只会把手快的人吃掉（2026-09-25 实测）
-_NO_COOLDOWN_PLATFORMS = frozenset({"webchat", "desktop_pet"})
+#   glasses      智能眼镜通道（2026-09-28 加）——戴着说话就是连续几句，
+#                8 秒冷却会把"补一句"直接丢掉，耳边的表现就是"她没听见"
+_NO_COOLDOWN_PLATFORMS = frozenset({"webchat", "desktop_pet", "glasses"})
 
 # Tag-like spans typed by chat participants must never act as markup: someone
 # writing "</think>" or "<|im_start|>" is trying to fake the model's own

@@ -477,6 +477,7 @@ class StoreTest(unittest.TestCase):
 
         class Fake:
             headers = {"Content-Length": str(len(body) * 10)}
+            status = 200
 
             def read(self, size: int = -1) -> bytes:
                 """Return the short body once."""
@@ -493,10 +494,63 @@ class StoreTest(unittest.TestCase):
         urllib.request.urlopen = lambda *a, **k: Fake()  # noqa: ARG005
         target = self.scratch / "model.onnx"
         with self.assertRaises(OSError) as caught:
-            model_store.download("https://example.test/x", target)
-        self.assertIn("下载中断", str(caught.exception))
+            model_store.download("https://example.test/x", target, attempts=2)
+        self.assertIn("下载失败", str(caught.exception))
         self.assertFalse(target.exists())
         print("PASS test_truncated_download_is_deleted")
+
+    def test_download_resumes_from_the_break(self) -> None:
+        """A second attempt continues with Range instead of starting over.
+
+        实测背景：Kokoro 的 model.onnx 有 310 MB，一次拉不完（两个源分别在 92/122 MB 被切断），
+        所以必须续传——这里用一个"第一次只给一半、第二次给另一半"的假服务端钉住它。
+        """
+        payload = b"x" * 400
+        seen_ranges: list[str] = []
+
+        class Fake:
+            def __init__(self, start: int) -> None:
+                self.start = start
+                self.headers = {
+                    "Content-Length": str(len(payload) - start),
+                    "Content-Range": f"bytes {start}-{len(payload) - 1}/{len(payload)}",
+                }
+                self.status = 206 if start else 200
+                self.body = payload[start:]
+                self.calls = 0
+                self.cut = start == 0  # 只有"从头下"的那一次模拟半路被切断
+
+            def read(self, size: int = -1) -> bytes:
+                """First attempt: give half, then reset the connection."""
+                self.calls += 1
+                if self.cut and self.calls == 1:
+                    half = max(1, len(self.body) // 2)
+                    chunk, self.body = self.body[:half], self.body[half:]
+                    return chunk
+                if self.cut and self.calls == 2:
+                    raise OSError("connection reset")
+                chunk, self.body = self.body, b""
+                return chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                return False
+
+        def factory(request, timeout=None):  # noqa: ANN001, ARG001
+            header = request.get_header("Range") or request.headers.get("Range")
+            seen_ranges.append(header or "")
+            start = int((header or "bytes=0-").split("=")[1].rstrip("-")) if header else 0
+            return Fake(start)
+
+        urllib.request.urlopen = factory
+        target = self.scratch / "big.onnx"
+        written = model_store.download("https://example.test/big", target, attempts=4)
+        self.assertEqual(written, len(payload))
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertTrue(any(r.startswith("bytes=") for r in seen_ranges), seen_ranges)
+        print(f"PASS test_download_resumes_from_the_break（第二次带 Range：{seen_ranges}）")
 
 
 if __name__ == "__main__":

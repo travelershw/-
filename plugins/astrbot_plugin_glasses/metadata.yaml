@@ -1,0 +1,4 @@
+name: glasses
+desc: 智能眼镜通道：随身设备的 WebSocket 平台（文本 + 裸 PCM 上下行 + 状态帧），派生于 desktop_pet
+author: migration
+version: 0.1.0

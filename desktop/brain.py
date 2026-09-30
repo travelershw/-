@@ -29,6 +29,30 @@ from persona import PERSONA
 
 DEFAULT_BASE = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
+# 「思考模式」下的模型名：DeepSeek V4.1 Flash 的两个入口（2026-09-27 实测）
+#   deepseek-chat  → 同一模型但**不思考**（0.82 s，秒回）
+#   deepseek-flash → 带思考（1.7–33 s，复杂问题更周到，但也可能思考吃光 max_tokens 返回空）
+THINK_MODEL = "deepseek-flash"
+FAST_MODEL = "deepseek-chat"
+# 只有这几个别名才允许被开关换掉：管理员自己填了别的模型（比如 v4-pro）就别动。
+SWITCHABLE_MODELS = ("", FAST_MODEL, THINK_MODEL, "deepseek-v4-flash", "deepseek-v4-flash-vision-exp")
+# 开思考时的默认输出预算：思考 token 也算在里面，给小了会返回空回复。
+THINK_MAX_TOKENS = 3000
+
+
+def model_for(config: dict) -> str:
+    """Which model should the standalone brain use, given the thinking switch?
+
+    Args:
+        config: The pet's config (``llm.model`` + ``thinking``).
+
+    Returns:
+        The model name to request.
+    """
+    configured = str(((config.get("llm") or {}).get("model") or "")).strip()
+    if configured and configured not in SWITCHABLE_MODELS:
+        return configured  # 主人自己选的模型，尊重他
+    return THINK_MODEL if bool(config.get("thinking", False)) else FAST_MODEL
 HISTORY_TURNS = 12
 MEMORY_INJECT = 3
 REQUEST_TIMEOUT = 90.0
@@ -411,12 +435,18 @@ class LocalBrainClient(QObject):
             ``{base_url, model, api_key, ...}``.
         """
         section = self.config.get("llm") or {}
+        thinking = bool(self.config.get("thinking", False))
         return {
             "base_url": str(section.get("base_url") or DEFAULT_BASE).rstrip("/"),
-            "model": str(section.get("model") or DEFAULT_MODEL),
+            # 思考开关在这里生效（见 model_for 的说明）
+            "model": model_for(self.config),
             "api_key": str(section.get("api_key") or ""),
             "temperature": float(section.get("temperature") or 0.8),
-            "max_tokens": int(section.get("max_tokens") or 600),
+            # 开着思考时默认给更大预算：V4 的思考会计入 completion_tokens，
+            # 600 的上限会被思考吃光、返回**空回复**（2026-09-27 实测）。
+            "max_tokens": int(
+                section.get("max_tokens") or (THINK_MAX_TOKENS if thinking else 600)
+            ),
         }
 
     def _vision(self) -> dict:

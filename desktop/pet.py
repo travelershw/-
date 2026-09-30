@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 import asr
 import camera
+import cloudvoice
 import faces
 import listening
 import microphone
@@ -381,12 +382,31 @@ DEFAULT_CONFIG = {
     "mic_keep_clip": False,
     # 对话模式（P4-b）：麦克风常开、由静音检测自动断句，说完就接话。
     # 默认关；只在"对话模式"里工作；锁屏不听；她说话/思考时不听（防自激）；
-    # 一段时间没交互自动退出。`voice` 是"她出声"的开关，**本轮先不做**，只留位。
+    # 一段时间没交互自动退出。
     "conversation": False,
     "vad_silence_ms": 600,
     "vad_min_speech_ms": 250,
     "conversation_idle_seconds": 180,
+    # 她出声（P10）：**豆包云端合成**，整段一次送出去、边收边放（首包约 0.4 秒）。
+    # 与已回滚的本机方案（P9：分句各自合成）最大的差别是**不切句**——停顿交给服务端，
+    # 韵律连贯；代价是要联网、声音出机器、按字计费（服务端会回报每次扣了多少字）。
+    # `api_key` 在控制台 > API Key 管理；`voice` 在控制台 > 音色库。
+    # `master` 是**语音总开关**：关掉就"既不出声、也不听"（子开关保持原样，方便一键恢复）。
     "voice": False,
+    "voice_master": True,
+    # 思考开关（2026-09-27）：DeepSeek V4.1 默认**带思考**，同一句普通问话
+    # 带思考 1.7–33 秒、问题复杂时思考还会吃光 token 返回空；不思考 0.82 秒。
+    # 桌宠要"秒回"，所以默认关。QQ 那边由 qingyu_core 的 `/思考` 命令控制，
+    # 桌宠这边点菜单等价于发一条 `/思考 开|关`；独立模式（mode: local）则直接生效。
+    "thinking": False,
+    "tts": {
+        "api_key": "",
+        "resource_id": "seed-tts-2.0",
+        "voice": "zh_female_vv_uranus_bigtts",
+        "speech_rate": 0,
+        "loudness_rate": 0,
+        "sample_rate": 24000,
+    },
     # 视频通话（P5）：摄像头常开、随时能"看到你"，但**只有说话时才把那一帧交出去**。
     # 默认关；关掉立刻释放摄像头；预览小窗显示"她此刻能看到的画面"。
     "video_call": False,
@@ -478,6 +498,12 @@ class PetWindow(QWidget):
         self._apply_mask()
 
         self.bubble = Bubble()
+        # 她出声（P10）：合成在后台线程、播放走 QAudioSink，这里只接它的三个信号
+        self._voice = cloudvoice.CloudVoice(self)
+        self._voice.configure(self.config.get("tts") or {})
+        self._voice.started.connect(self.on_speech_started)
+        self._voice.finished.connect(self.on_speech_finished)
+        self._voice.failed.connect(self.on_speech_failed)
         self._poll = QTimer(self)
         self._poll.timeout.connect(self.refresh)
         self._poll.start(int(self.config["poll_ms"]))
@@ -613,6 +639,19 @@ class PetWindow(QWidget):
     def _build_menu(self) -> None:
         """Create the right-click / tray menu."""
         menu = QMenu(self)
+        self.act_voice_master = QAction("🔊 语音总开关（听 + 说）", self, checkable=True)
+        self.act_voice_master.setToolTip(
+            "一键关掉全部语音：她不出声、麦克风也不听。子开关保持原样，再点一下就恢复。"
+        )
+        self.act_voice_master.setChecked(bool(self.config.get("voice_master", True)))
+        self.act_voice_master.triggered.connect(self.toggle_voice_master)
+        self.act_thinking = QAction("让她先想一想（思考模式）", self, checkable=True)
+        self.act_thinking.setToolTip(
+            "关着（默认）＝直接答，约 1 秒；打开＝说话前先想，复杂问题更周到，"
+            "但一句普通问话也要 1.7–30 秒。"
+        )
+        self.act_thinking.setChecked(bool(self.config.get("thinking", False)))
+        self.act_thinking.triggered.connect(self.toggle_thinking)
         act_status = QAction("她现在的状态", self)
         act_status.triggered.connect(self.show_status)
         act_line = QAction("说句话", self)
@@ -679,11 +718,27 @@ class PetWindow(QWidget):
         )
         self.act_video.setChecked(bool(self.config.get("video_call", False)))
         self.act_video.triggered.connect(self.toggle_video_call)
+        self.act_voice = QAction("用声音回答（豆包云端）", self, checkable=True)
+        self.act_voice.setToolTip(
+            "开着时她的回答会念出来：整段一次合成、边收边放（首包约 0.4 秒），"
+            "点她一下就能打断。合成在云端（要联网、按字计费），声音会离开这台机器。"
+        )
+        self.act_voice.setChecked(bool(self.config.get("voice", False)))
+        self.act_voice.triggered.connect(self.toggle_voice)
+        act_hush = QAction("别说了", self)
+        act_hush.setToolTip("打断她正在念的这一句（点她一下也一样）")
+        act_hush.triggered.connect(self.hush)
+        act_tts_key = QAction("豆包语音 Key…", self)
+        act_tts_key.setToolTip("粘贴控制台 > API Key 管理 里的 Key；音色 ID 在 tts.voice")
+        act_tts_key.triggered.connect(self.set_tts_key)
         act_setup = QAction("设置 API Key…", self)
         act_setup.triggered.connect(self.open_setup)
         act_link = QAction("重连 AstrBot", self)
         act_link.setToolTip("断线不会自动重连，点这里手动再连一次")
         act_link.triggered.connect(self.reconnect_link)
+        menu.addAction(self.act_voice_master)
+        menu.addAction(self.act_thinking)
+        menu.addSeparator()
         menu.addAction(act_status)
         menu.addAction(act_recent)
         menu.addAction(act_screen)
@@ -697,6 +752,9 @@ class PetWindow(QWidget):
         menu.addAction(self.act_mic_on)
         menu.addAction(self.act_conversation)
         menu.addAction(self.act_video)
+        menu.addAction(self.act_voice)
+        menu.addAction(act_hush)
+        menu.addAction(act_tts_key)
         menu.addAction(act_asr_key)
         menu.addAction(act_mic_pick)
         menu.addAction(act_mic_level)
@@ -739,7 +797,7 @@ class PetWindow(QWidget):
             self._size_actions.append((value, action))
             size_menu.addAction(action)
         act_quit = QAction("退出桌宠", self)
-        act_quit.triggered.connect(QApplication.quit)
+        act_quit.triggered.connect(self.quit_app)
         menu.addAction(act_reset)
         menu.addAction(act_art)
         menu.addAction(act_quit)
@@ -840,15 +898,24 @@ class PetWindow(QWidget):
             lines.append(f"{when}【{item['group_name']}】{item['text'][:90]}")
         self.say("\n".join(lines), 15000)
 
-    def say(self, text: str, msec: int = 7000) -> None:
-        """Show a bubble above her head.
+    def say(self, text: str, msec: int = 7000, *, speak: bool | None = None) -> None:
+        """Show a bubble above her head — and, when it is worth it, say it out loud.
+
+        这就是"所有按钮都有语音"的入口：菜单结果、她的主动话都会念出来；
+        进度提示（"我查查天气…"）、回声（"你：「…」"）、报错原文不念——
+        判断规则在 `cloudvoice.should_speak` 里，有单元测试钉着。
 
         Args:
             text: Line to show.
             msec: How long to keep it.
+            speak: 强制念/不念；``None`` = 交给规则判断。
         """
         anchor = QPoint(self.x() + self.width() // 2, self.y() + 8)
         self.bubble.show_text(text, anchor, msec)
+        if speak is None:
+            speak = cloudvoice.should_speak(text)
+        if speak and self.voice_on():
+            self._voice.speak(text)
 
     def say_line(self) -> None:
         """Say one of her idle lines for the current look."""
@@ -947,7 +1014,8 @@ class PetWindow(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         look = self.look
-        if time.time() < self._speaking_until:
+        # 嘴动：`_speaking_until` 是"气泡刚冒出来"的动画计时，出声时另有真实时长
+        if time.time() < self._speaking_until or self._voice.is_speaking():
             look = faces.speak_look(look)
         if not self.state.online:
             painter.setOpacity(0.62)
@@ -967,15 +1035,47 @@ class PetWindow(QWidget):
 
         默认走 ``desktop_pet`` 平台通道（阶段 D）：会话固定、身份是你的 QQ，她记得住、
         好感精力也算数；连不上时自动回落到面板通道（阶段 B）。
+
+        2026-09-27：这条路径**全部打上日志**。原因：桌宠是用 pythonw 拉起来的、没有控制台，
+        槽函数里抛的异常只会写到不存在的 stderr 上**静默丢掉**——主人报"点了没反应"时，
+        日志里什么都查不到。现在无论成功还是失败都会在 `pet_log.txt` 里留一行，
+        窗口还会被**强制拉回屏幕内**（位置存坏了/多屏拔掉都会导致窗口开到看不见的地方）。
         """
-        if getattr(self, "_chat_window", None) is None:
-            self._chat_window = ChatWindow(
-                self._client or self._make_client(),
-                on_shot=self.look_at_screen,
+        try:
+            if getattr(self, "_chat_window", None) is None:
+                note("打开聊天窗：创建")
+                self._chat_window = ChatWindow(
+                    self._client or self._make_client(),
+                    on_shot=self.look_at_screen,
+                )
+            chat = self._chat_window
+            chat.show()
+            self._clamp_to_screen(chat)
+            chat.raise_()
+            chat.activateWindow()
+            note(
+                f"打开聊天窗：可见={chat.isVisible()} 位置={chat.x()},{chat.y()} "
+                f"大小={chat.width()}x{chat.height()} 通道={type(chat.client).__name__}"
             )
-        self._chat_window.show()
-        self._chat_window.raise_()
-        self._chat_window.activateWindow()
+        except Exception as exc:  # noqa: BLE001 - 不能静默：主人看不到控制台
+            note(f"打开聊天窗失败：{type(exc).__name__}: {exc}")
+            self.say(f"聊天窗打不开：{type(exc).__name__}: {exc}", 12000, speak=False)
+
+    def _clamp_to_screen(self, window) -> None:  # noqa: ANN001 - QWidget
+        """Pull a window back into the visible screen area.
+
+        Args:
+            window: The window to clamp.
+        """
+        screen = window.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        x = min(max(window.x(), area.left()), area.right() - window.width())
+        y = min(max(window.y(), area.top()), area.bottom() - window.height())
+        if (x, y) != (window.x(), window.y()):
+            note(f"聊天窗位置 {window.x()},{window.y()} 在屏幕外 → 拉回 {x},{y}")
+            window.move(x, y)
 
     def _make_client(self):
         """Build and start the chat client for the configured mode.
@@ -1249,7 +1349,7 @@ class PetWindow(QWidget):
         Returns:
             One of 待机 / 在听 / 在看你 / 在想 / 在说.
         """
-        if time.time() < getattr(self, "_speaking_until", 0.0):
+        if time.time() < getattr(self, "_speaking_until", 0.0) or self._voice.is_speaking():
             return "在说"
         if self._thinking:
             return "在想"
@@ -1316,10 +1416,16 @@ class PetWindow(QWidget):
             conversation=self._conversation_on(),
             locked=readings.get("locked"),
             thinking=False if force else self._thinking,
-            speaking=False if force else time.time() < getattr(self, "_speaking_until", 0.0),
+            speaking=False
+            if force
+            else (
+                time.time() < getattr(self, "_speaking_until", 0.0)
+                or self._voice.is_speaking()
+            ),
             has_device=bool(microphone.devices()),
             already_running=self._listening_now(),
-            mic_enabled=bool(self.config.get("mic_listen", False)),
+            # 语音总开关关掉时，麦克风一律不开（子开关保持原样，方便一键恢复）
+            mic_enabled=bool(self.config.get("mic_listen", False)) and self.voice_master_on(),
         )
         if not allowed:
             if reason and reason != "已经在听了":
@@ -1354,6 +1460,154 @@ class PetWindow(QWidget):
             return
         self._conversation_touch()
         self._start_listening(force=True)
+
+    # ------------------------------------------------------------ 她出声（P10）
+
+    def voice_master_on(self) -> bool:
+        """Is the voice master switch on (she may speak **and** listen)?
+
+        Returns:
+            True unless the user turned the whole voice stack off.
+        """
+        return bool(self.config.get("voice_master", True))
+
+    def voice_on(self) -> bool:
+        """Should her replies be spoken out loud?
+
+        Returns:
+            True when the master switch, the speech switch, and key+voice are all in place.
+        """
+        return (
+            self.voice_master_on()
+            and bool(self.config.get("voice", False))
+            and self._voice.available()
+        )
+
+    def toggle_voice_master(self, checked: bool) -> None:
+        """Turn the whole voice stack on/off (menu 「语音总开关（听+说）」).
+
+        关掉＝立刻闭嘴 + 关麦；子开关（「允许麦克风」「用声音回答」）**保持原样**，
+        所以再打开时还是你原来那套设置。
+
+        Args:
+            checked: The menu state.
+        """
+        self.config["voice_master"] = bool(checked)
+        save_config(self.config)
+        if checked:
+            note("语音总开关 开")
+            self.say("语音开了：她出声、也听你说话。", 5000, speak=False)
+            return
+        self._voice.stop()
+        self._stop_listening()
+        note("语音总开关 关（不出声、不听）")
+        self.say("语音关了：她不出声，也不听你说话（设置都留着，再点一下就恢复）。", 8000, speak=False)
+
+    def toggle_voice(self, checked: bool) -> None:
+        """Turn spoken replies on/off (menu 「用声音回答（豆包云端）」).
+
+        Args:
+            checked: The menu state.
+        """
+        self.config["voice"] = bool(checked)
+        save_config(self.config)
+        if not checked:
+            self._voice.stop()
+            note("关掉声音回答")
+            return
+        if not self._voice.available():
+            note("想开声音回答，但没填 Key / 没选音色 / 没有播放组件")
+            self.say(
+                "还不能出声：右键「豆包语音 Key…」把 Key 填上，"
+                "音色 ID 写在 config.json 的 tts.voice（控制台 > 音色库）。",
+                10000,
+            )
+            self.config["voice"] = False
+            self.act_voice.setChecked(False)
+            save_config(self.config)
+            return
+        note(f"开声音回答：{self._voice.describe()}")
+
+    def set_tts_key(self) -> None:
+        """Ask for the Doubao API key (menu 「豆包语音 Key…」)."""
+        current = str((self.config.get("tts") or {}).get("api_key") or "")
+        text, ok = QInputDialog.getText(
+            self,
+            "豆包语音 Key",
+            "粘贴控制台 > API Key 管理 里的 Key（留空＝清除）：",
+            text=current,
+        )
+        if not ok:
+            return
+        block = dict(self.config.get("tts") or {})
+        block["api_key"] = text.strip()
+        self.config["tts"] = block
+        save_config(self.config)
+        self._voice.configure(block)
+        note(f"更新豆包语音 Key（{'已填' if block['api_key'] else '已清空'}）：{self._voice.describe()}")
+        if block["api_key"]:
+            self.say(f"好，现在用 {self._voice.voice or '（还没选音色）'} 的声音。", 6000)
+
+    def hush(self) -> None:
+        """Cut off what she is saying (menu 「别说了」/ 点她一下)."""
+        if self._voice.is_speaking():
+            self._voice.stop()
+            note("打断她念话")
+            self._speaking_until = 0.0
+            self.update()
+
+    def on_speech_started(self) -> None:
+        """She just started making sound: keep the mouth moving."""
+        self._speaking_until = time.time() + 1.0
+        self.update()
+
+    def on_speech_finished(self) -> None:
+        """The whole reply has been played: now it is safe to listen again."""
+        self._speaking_until = 0.0
+        self.update()
+        usage = self._voice.last_usage()
+        if usage:
+            note(f"念完了（服务端计费回报 {usage}）")
+        self._resume_after_reply()
+
+    def on_speech_failed(self, message: str) -> None:
+        """Report a voice problem without breaking the conversation.
+
+        Args:
+            message: Failure text.
+        """
+        note(f"她出声失败：{message}")
+        self.say(f"（说不出话来了：{message}）", 9000)
+        self._resume_after_reply()
+
+    def toggle_thinking(self, checked: bool) -> None:
+        """Turn her "think before answering" mode on/off (menu 「让她先想一想」).
+
+        两条通道各走各的：
+
+        - **独立模式（mode: local）**：`brain.model_for()` 直接按这个开关选模型（立刻生效）；
+        - **AstrBot 模式**：模型是 AstrBot 那边决定的，所以这里**发一条 `/思考 开|关`
+          给桌面通道**，由 `qingyu_core` 的命令改它的开关（改完立刻生效、不用重载）。
+
+        Args:
+            checked: The menu state.
+        """
+        self.config["thinking"] = bool(checked)
+        save_config(self.config)
+        if str(self.config.get("mode") or "astrbot") == "local":
+            note(f"思考模式 {'开' if checked else '关'}（独立模式，直接生效）")
+            self.say(
+                "好，我会先想一想再答。" if checked else "好，我直接答，快一点。",
+                6000,
+            )
+            return
+        client = self._client or self._make_client()
+        client.send(f"/思考 {'开' if checked else '关'}")
+        note(f"思考模式 {'开' if checked else '关'}（已通知 AstrBot）")
+        self.say(
+            "好，我会先想一想再答（会慢一些）。" if checked else "好，我直接答，快一点。",
+            6000,
+        )
 
     def _idle_seconds(self) -> float:
         """Configured auto-exit window, clamped to something sane.
@@ -1413,7 +1667,9 @@ class PetWindow(QWidget):
         # 看门狗：对话模式开着、人没锁屏、她也没在忙，但麦克风关着 → 一定是哪一步漏了，
         # 自己捞回来（force：忽略"她正在想/说"这两个只该用于防自激的闸门）。
         # **"只对第一句有反应"那种卡死就是靠这条兜住的**（原来没人重试）。
-        if not self._listening_now():
+        # 例外（P10）：她**真的在出声**时麦克风就该是关的——那不是"漏了"，强行开麦
+        # 会把她的声音录回来喂给自己。等她念完，`on_speech_finished` 会自己续听。
+        if not self._listening_now() and not self._voice.is_speaking() and self.voice_master_on():
             note("发现麦克风关着但对话模式开着，自动重新开麦")
             self._start_listening(force=True)
 
@@ -2061,13 +2317,16 @@ class PetWindow(QWidget):
         self._speaking_until = time.time() + 2.5
         self._stream_text = ""
         self._thinking = False
-        self.say(text, SPEAK_BUBBLE_MS)
+        self.say(text, SPEAK_BUBBLE_MS, speak=False)
+        # 她出声：**整段一次送出去**（不切句——切句会让句间韵律断裂），边收边放
+        speaking = self.voice_on() and self._voice.speak(text)
         # 她在回答期间你插的话，现在并成一轮发出去（不丢话）
         if self._pending_speech:
             self.flush_pending_speech()
             return
-        # 她的回复到齐了：对话模式继续听下一句
-        self._resume_after_reply()
+        # 她的回复到齐了：对话模式继续听下一句（出声时等她念完，见 on_speech_finished）
+        if not speaking:
+            self._resume_after_reply()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
         """Start a drag or remember a click.
@@ -2101,7 +2360,11 @@ class PetWindow(QWidget):
         self._dragging = False
         self._remember_position()
         if moved <= 4:
-            self.say_line()
+            # 她正念着话时点她 = 打断（比"再说一句"更符合直觉）
+            if self._voice.is_speaking():
+                self.hush()
+            else:
+                self.say_line()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt naming
         """Double click opens the chat window.
@@ -2120,13 +2383,21 @@ class PetWindow(QWidget):
         self.menu.popup(event.globalPos())
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        """Persist the position on exit.
+        """Persist the position and close the voice connection on exit.
 
         Args:
             event: Close event.
         """
         self._remember_position()
+        # 退出时先闭嘴并断开长连接：不然语音线程还捏着音频设备/套接字，退出会拖一两秒
+        self._voice.shutdown()
         event.accept()
+
+    def quit_app(self) -> None:
+        """Quit from the menu (「退出桌宠」): stop the voice, then leave."""
+        self._remember_position()
+        self._voice.shutdown()
+        QApplication.quit()
 
 
 def screenshot(path: str) -> None:

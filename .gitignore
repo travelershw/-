@@ -87,3 +87,16 @@ Desktop.ini
 .vscode/
 .idea/
 *.suo
+
+# ===== 手机端（phone/）：构建产物与第三方二进制不进仓库 =====
+# android/ 整个是 tools/gen-android.js 生成的 Gradle 工程；vendor/ 是打包时要塞进去的
+# Tailscale 官方 APK（100 MB）；dist/ 是打包产物，**里面带中转令牌**，绝不进仓库。
+phone/android/
+phone/vendor/
+phone/dist/
+phone/node_modules/
+phone/.toolchain/
+phone/.toolchain.local
+phone/local.properties
+# 任何 APK 都不进源码仓库：App 走 Release 资产，别的 APK 属于第三方二进制
+*.apk

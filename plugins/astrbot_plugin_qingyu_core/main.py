@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Plain, Record
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core import logger
@@ -31,6 +31,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from . import (
+    audioguard,
     chance,
     decide,
     express,
@@ -41,13 +42,35 @@ from . import (
     report,
     store,
     style,
+    thinking,
+    tts,
     tuning,
+    voice,
     world,
 )
 
 ENFORCE = True
 # 兜底的人设名：读不到人设表时用它认"正文里是不是在叫她"（人设名存在 personas 表里）。
 SELF_FALLBACK_NAME = "轻语"
+
+
+def _is_deepseek_provider(provider) -> bool:  # noqa: ANN001 - AstrBot 的 Provider
+    """这个 provider 是不是 DeepSeek？（只有它认 `deepseek-flash` / `deepseek-chat`）
+
+    Args:
+        provider: AstrBot provider object.
+
+    Returns:
+        True when it points at api.deepseek.com.
+    """
+    client = getattr(provider, "client", None)
+    host = str(getattr(getattr(client, "base_url", None), "host", "") or "")
+    if host:
+        return "deepseek" in host
+    config = getattr(provider, "provider_config", {}) or {}
+    return any(
+        "deepseek" in str(config.get(key) or "") for key in ("api_base", "model", "provider")
+    )
 # 名字后面跟着这些虚词时，多半是"别人在议论她"而不是在跟她说话（例：「轻语又没法进行开发」）。
 GOSSIP_AFTER = ("又", "还", "也", "已经", "都", "就", "好像", "真的", "不是", "原来")
 # 「她刚开口，群友接着跟她聊」的接力窗口：时间范围与"像在接话"的字数门槛。
@@ -74,7 +97,7 @@ DUPLICATE_REPLY_SECONDS = 20
 EXPRESS_ENFORCE = True
 # 插嘴写超了要不要让她重写一句（多花一次模型调用，但比"事后截断"自然）。
 CHIME_REWRITE = True
-PLUGIN_VERSION = "0.19.0"
+PLUGIN_VERSION = "0.19.1"
 # 决策只对真实聊天生效，这些平台不参与。
 SKIP_PLATFORMS = ("webchat",)
 # 好感度还由旧插件写 JSON，这里定期镜像进 relations 表（阶段 C 会搬过来）。
@@ -459,6 +482,157 @@ class QingyuCorePlugin(Star):
         )
         logger.info(f"qingyu_core: 这轮调了工具 {name}")
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def note_user_voice(self, event: AstrMessageEvent) -> None:
+        """记下"这条消息本身是语音"。
+
+        夜里（23:00–08:00）只有这种才回语音——对等回应，不主动吵人；其余时间也用它
+        做"你刚发语音，她优先回语音"的判断（见 :mod:`voice`）。
+
+        Args:
+            event: 收到的消息事件。
+        """
+        message = getattr(getattr(event, "message_obj", None), "message", None) or []
+        if any(type(part).__name__ == "Record" for part in message):
+            event.set_extra("qingyu.user_voice", True)
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-100)
+    async def keep_audio_from_breaking_the_turn(self, event: AstrMessageEvent) -> None:
+        """本机没有 ffmpeg 时，先摘掉消息里的语音，免得整轮回复被打断。
+
+        AstrBot 转码语音要调 PATH 里的 ffmpeg，而它自己那条分支没有兜底：消息里
+        （尤其**被引用消息**的链里）有语音时会把 ``ffmpeg not found`` 抛到 agent 层，
+        整轮不答，还往群里发一句英文报错（2026-09-27 21:36 实测）。这里在插件侧挡
+        一下，让"能听不到"变成"只是听不到"。
+
+        优先级给负值＝在所有插件处理函数里**最后**跑：``note_user_voice`` 得先记下
+        "这条是语音"，夜里对等回语音的规则不受影响。
+
+        Args:
+            event: 收到的消息事件。
+        """
+        if audioguard.ffmpeg_available():
+            return
+        message = getattr(getattr(event, "message_obj", None), "message", None)
+        if not isinstance(message, list) or not message:
+            return
+        own, quoted = audioguard.strip_audio(message)
+        if own or quoted:
+            logger.warning(
+                f"qingyu_core: 本机没装 ffmpeg，这轮的 {own} 段语音（引用里 {quoted} 段）"
+                "只留占位文字、不转码（否则整轮请求会失败）",
+            )
+
+    def _glasses_platform(self, umo: str):  # noqa: ANN202 - AstrBot 平台实例
+        """这个会话是不是设备通道（眼镜）？是就把平台实例给出来。
+
+        Args:
+            umo: 会话 origin。
+
+        Returns:
+            眼镜平台实例；不是眼镜会话、或平台没在跑时返回 None。
+        """
+        if "glasses" not in str(umo):
+            return None
+        try:
+            for platform in self.context.platform_manager.platform_insts:
+                meta = platform.meta()
+                if meta.name == "glasses" and str(meta.id) in str(umo):
+                    return platform
+        except Exception as exc:  # noqa: BLE001 - 拿不到就当没有
+            logger.debug(f"qingyu_core: 找眼镜通道失败（{type(exc).__name__}）")
+        return None
+
+    @filter.on_decorating_result(priority=-50)
+    async def maybe_auto_voice(self, event: AstrMessageEvent) -> None:
+        """合适的时候把这条文字回复换成语音（规则见 :mod:`voice`）。
+
+        放在最后一步做（priority 给负值＝**最后**执行）：文案已经定稿、也还没发出去，
+        改消息链最安全；合成失败就保持原样发文字——**绝不能因为想出声而丢消息**。
+
+        Args:
+            event: 即将发出回复的消息事件。
+        """
+        result = event.get_result()
+        chain = getattr(result, "chain", None) or []
+        if not chain:
+            return
+        kinds = {type(part).__name__ for part in chain}
+        if "Record" in kinds:
+            return  # 已经是语音了，别叠一层
+        text = "".join(
+            str(getattr(part, "text", "")) for part in chain if type(part).__name__ == "Plain"
+        ).strip()
+        if not text:
+            return
+        platform = str(event.get_platform_name() or "")
+        umo = event.unified_msg_origin
+        # 她的状态（心情/精力）与跟这个人的关系——用来决定"怎么念"（语速/音调）
+        snapshot = event.get_extra("qingyu.snapshot")
+        person = getattr(snapshot, "person", None)
+        mood = getattr(snapshot, "mood", None)
+        decision = voice.decide(
+            text=text,
+            umo=umo,
+            platform=platform,
+            is_private=not str(event.get_group_id() or ""),
+            user_was_voice=bool(event.get_extra("qingyu.user_voice")),
+            mood=getattr(mood, "mood", None),
+            energy=getattr(mood, "energy", None),
+            trust=getattr(person, "trust", None),
+            familiarity=getattr(person, "familiarity", None),
+        )
+        if not decision.allowed:
+            logger.info(f"qingyu_core: 这条用文字（{decision.reason}）")
+            return
+        # 设备通道（眼镜）：**边合成边推**。整句合成完再推，实测开口要 5.1 秒
+        # （2026-09-28），耳朵上等不起；豆包本来是一段一段给的，收到就推。
+        device = self._glasses_platform(umo)
+        if device is not None and not voice.settings()["dual"]:
+            billed = 0
+            pushed = 0
+            try:
+                pushed, billed = await device.push_audio_stream(
+                    tts.stream(text, extra=decision.params()),
+                    sample_rate=tts.sample_rate(),
+                )
+            except tts.TTSError as exc:
+                logger.warning(
+                    f"qingyu_core: 想发语音但没合成出来（{exc}），照旧发文字",
+                )
+                return
+            if pushed:
+                result.chain = []  # 声音已经推给设备了，别再发一遍文字
+                voice.record(umo, len(text), billed)
+                left = voice.consume_test(umo)
+                logger.info(
+                    f"qingyu_core: 这条用语音发（流式｜{decision.reason}"
+                    f"｜{decision.describe_voice()}｜{len(text)} 字，服务端计费 {billed} 字"
+                    f"{'｜' + left if left else ''}）",
+                )
+                return
+            logger.warning("qingyu_core: 设备没接住音频，这一轮还是发文字")
+        try:
+            audio, extension, billed = await tts.synthesize(
+                text, extra=decision.params()
+            )
+        except tts.TTSError as exc:
+            logger.warning(f"qingyu_core: 想发语音但没合成出来（{exc}），照旧发文字")
+            return
+        path = tts.save_audio(audio, extension)
+        record = Record.fromFileSystem(path=path)
+        if voice.settings()["dual"]:
+            chain.append(record)
+        else:
+            result.chain = [record]
+        voice.record(umo, len(text), billed)
+        left = voice.consume_test(umo)
+        logger.info(
+            f"qingyu_core: 这条用语音发（{decision.reason}｜{decision.describe_voice()}"
+            f"｜{len(text)} 字，服务端计费 {billed} 字"
+            f"{'｜' + left if left else ''}）",
+        )
+
     @filter.on_decorating_result(priority=100)
     async def record_outgoing(self, event: AstrMessageEvent) -> None:
         """把她正要发出去的话记进 ``pet_events``（桌宠要冒泡显示）。
@@ -689,6 +863,21 @@ class QingyuCorePlugin(Star):
             or express.length_hint(plan)
             or express.lazy_hint(plan, text)
         )
+        # 眼镜通道：她是"在耳边说话"，要短、口语、别念格式（2026-09-28 实测第一轮
+        # 回了 8.6 秒，耳朵上那是折磨）。这条提示与其它提示**可以叠加**。
+        on_device = "glasses" in str(getattr(event, "unified_msg_origin", "") or "")
+        if not hint and not on_device:
+            return
+        if on_device:
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text=(
+                        "\n（你现在是戴在他耳边说话：**最多两句、25 字以内**，"
+                        "像随口接一句；不要列表、括号说明、书面语或表情符号）"
+                    ),
+                ),
+            )
+            logger.info("qingyu_core: 眼镜通道这轮要求口语短句（≤25 字、最多两句）")
         if not hint:
             return
         req.extra_user_content_parts.append(TextPart(text="\n" + hint))
@@ -715,6 +904,36 @@ class QingyuCorePlugin(Star):
             logger.info(f"qingyu_core: 这轮加了长度提示（上限 {plan.max_chars} 字）")
         else:
             logger.info("qingyu_core: 这轮让她偷懒，只回一句")
+
+    @filter.on_llm_request()
+    async def apply_thinking_switch(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """按「思考」开关决定这次请求走思考入口还是快速入口（只换模型名）。
+
+        为什么能这么做：``ProviderRequest.model`` 就是请求体里的 `model`
+        （``tool_loop_agent_runner`` 里 `payload["model"] = self.req.model`），
+        所以**不用改 AstrBot 的配置、不用重启**，QQ 和桌宠两条通道都立刻生效。
+        实测数据见 ``thinking.py`` 顶部：不带思考 0.82 s，带思考 1.7–33 s 且可能空回复。
+
+        Args:
+            event: 消息事件。
+            req: 即将发出的请求。
+        """
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if provider is None or not _is_deepseek_provider(provider):
+            return
+        config = getattr(provider, "provider_config", {}) or {}
+        current = req.model or str(config.get("model") or "")
+        wanted = thinking.enabled()
+        picked = thinking.pick_model(current, wanted)
+        if picked is None or picked == current:
+            return
+        req.model = picked
+        logger.info(
+            f"qingyu_core: 思考开关={'开' if wanted else '关'}，这次用 {picked}"
+            f"（本来会用 {current or '默认'}）",
+        )
 
     @filter.on_llm_request()
     async def inject_holiday(
@@ -757,11 +976,12 @@ class QingyuCorePlugin(Star):
         event.set_extra("qingyu.delay_done", True)
         plan = event.get_extra("qingyu.plan")
         # 桌面通道＝面对面说话：走"快速档"（停顿 ≤0.4 秒），QQ 群聊那边保持原样。
+        # 眼镜通道同理（2026-09-28）：戴在耳边，停顿超过 0.4 秒就像卡住。
         umo = str(getattr(event, "unified_msg_origin", "") or "")
         await express.wait_before_reply(
             plan,
             event.message_str or "",
-            fast="desktop_pet" in umo,
+            fast=("desktop_pet" in umo or "glasses" in umo),
         )
 
     # ---------------------------------------------------------------- 行动层工具
@@ -1060,6 +1280,124 @@ class QingyuCorePlugin(Star):
             )
             return
         yield event.plain_result(tuning.save(target, value))
+
+    @filter.command("思考")
+    async def thinking_switch(self, event: AstrMessageEvent):
+        """看/改「说话前先想一想」（管理员，改完立刻生效、不用重载）。
+
+        用法：``/思考`` 看状态；``/思考 开`` 先想再答；``/思考 关`` 直接答；
+        ``/思考 默认`` 还原。
+
+        Args:
+            event: 指令消息事件。
+
+        Yields:
+            结果文本。
+        """
+        if not event.is_admin():
+            yield event.plain_result("这个只有管理员能用哦~")
+            return
+        argument = (event.message_str or "").replace("思考", "", 1).strip()
+        # AstrBot 的唤醒前缀（默认 "/"）在 `waking_check` 里就已经从 message_str 剥掉了，
+        # 这里再兜一下：万一有平台把斜杠留下，也别把参数认成 "/ 开"。
+        argument = argument.lstrip("/").strip().lower()
+        if not argument:
+            yield event.plain_result(
+                f"{thinking.describe()}\n"
+                "开＝说话前先想（1.7–30 秒，复杂问题更周到）；关＝直接答（约 1 秒）。\n"
+                "改法：/思考 开　/思考 关　/思考 默认",
+            )
+            return
+        if argument in {"开", "打开", "on", "true", "1"}:
+            yield event.plain_result(thinking.set_enabled(True))
+            return
+        if argument in {"关", "关闭", "off", "false", "0"}:
+            yield event.plain_result(thinking.set_enabled(False))
+            return
+        if argument in {"默认", "还原", "reset", "default"}:
+            yield event.plain_result(thinking.clear())
+            return
+        yield event.plain_result("要填「开」或「关」哦，比如 /思考 开")
+
+    @filter.command("语音")
+    async def voice_command(self, event: AstrMessageEvent):
+        """语音：念一句话，或开关"自动语音"（管理员）。
+
+        第一阶段：**只由指令触发**；第二阶段（现在）：可选**自动语音**——
+        在合适的时候（私聊、短句、问候/关心类、不在冷却和预算内）把文字回复换成语音，
+        规则和理由都写在 :mod:`voice` 里。
+
+        用法：``/语音 今天早点睡`` 念这句话；``/语音`` 念她上一条；
+        ``/语音 自动 开|关`` 开关这个会话的自动语音；``/语音 统计`` 看今天发了多少。
+
+        Args:
+            event: 指令消息事件。
+
+        Yields:
+            语音消息、统计文字，或出错时的说明。
+        """
+        if not event.is_admin():
+            yield event.plain_result("这个只有管理员能用哦~")
+            return
+        argument = (event.message_str or "").replace("语音", "", 1).strip()
+        # AstrBot 的唤醒前缀（默认 "/"）在 waking_check 里已剥掉；这里再兜一下
+        argument = argument.lstrip("/").strip()
+        head, _, rest = argument.partition(" ")
+        if head in {"测试", "test"}:
+            wanted = rest.strip().lower()
+            if wanted in {"开", "on", "true", "1", "打开"}:
+                yield event.plain_result(voice.set_test(event.unified_msg_origin, True))
+            elif wanted in {"关", "off", "false", "0", "关闭"}:
+                yield event.plain_result(voice.set_test(event.unified_msg_origin, False))
+            else:
+                yield event.plain_result(voice.stats_text(event.unified_msg_origin))
+            return
+        if head in {"自动", "auto"}:
+            wanted = rest.strip().lower()
+            if wanted in {"开", "on", "true", "1", "打开"}:
+                yield event.plain_result(voice.set_auto(event.unified_msg_origin, True))
+            elif wanted in {"关", "off", "false", "0", "关闭"}:
+                yield event.plain_result(voice.set_auto(event.unified_msg_origin, False))
+            else:
+                yield event.plain_result(voice.stats_text(event.unified_msg_origin))
+            return
+        if head in {"统计", "stats", "状态"}:
+            yield event.plain_result(voice.stats_text(event.unified_msg_origin))
+            return
+        note = ""
+        if argument:
+            text = argument
+        else:
+            previous = self._last_reply.get(event.unified_msg_origin)
+            text = previous[0] if previous else ""
+            if not text:
+                yield event.plain_result(
+                    "我还不知道要念什么——发「/语音 想说的话」试试；"
+                    "想让我以后自动出声，发「/语音 自动 开」。",
+                )
+                return
+            note = "（念的是我上一条）"
+        if not tts.available():
+            yield event.plain_result(
+                "还不能出声：先把豆包语音的 Key 写进 "
+                f"{tts.CONFIG_PATH}（api_key 字段），音色在同一个文件的 voice。",
+            )
+            return
+        text, trimmed = tts.prepare_text(text)
+        try:
+            audio, extension, billed = await tts.synthesize(text)
+        except tts.TTSError as exc:
+            logger.warning(f"qingyu_core: 语音合成失败：{exc}")
+            yield event.plain_result(f"说不出话来了：{exc}")
+            return
+        path = tts.save_audio(audio, extension)
+        logger.info(
+            f"qingyu_core: 语音 {len(text)} 字 → {path.name}"
+            f"（{len(audio) / 1024:.0f} KB，服务端计费 {billed} 字）",
+        )
+        yield event.chain_result([Record.fromFileSystem(path=path)])
+        if trimmed or note:
+            yield event.plain_result("".join(part for part in (trimmed, note) if part))
 
     @filter.command("风格")
     async def style_command(self, event: AstrMessageEvent):
