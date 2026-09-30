@@ -22,6 +22,7 @@
 | `tools/build-apk.js` | 调 Gradle 出 APK |
 | `tools/make-dist.js` | 打「分发包」（APK + 安装说明 + 版本说明） |
 | `tools/make-remote-kit.js` | 打「异地测试包」（把 Tailscale 官方 APK 一起带上，摘要钉死） |
+| `tools/make-public-guide.js` | 生成**公开版**说明（不带令牌，文件名用 Release 上的 ASCII 名） |
 | `tools/page-protocol-test.js` | 页面/协议自测（不开 Gradle、不开手机） |
 | `tools/verify-apk.ps1`、`tools/verify-dex.js` | 产物校验（签名、版本号、关键 Java 是否真的进了包） |
 | `tools/fetch-toolchain.js`、`install-toolchain.js`、`setup-android-sdk.js` | 自建工具链（没有现成的那份时用） |

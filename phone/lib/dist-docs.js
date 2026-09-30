@@ -144,16 +144,22 @@ v0.1.0
  * @param {string} info.tailscaleSha256 Tailscale APK 的 SHA-256。
  * @param {string} info.tailnetUrl 连接地址(wss://…:8443/)。
  * @param {string} info.machineName 作者那台电脑在 Tailscale 里的名字。
- * @param {string} info.token 手机中转的令牌(只发给这一个人)。
+ * @param {string} info.token 手机中转的令牌;留空表示这份说明**不带令牌**(公开版),
+ *   此时那一步会改成"作者单独发给你"。
  * @param {string} info.tailscaleSourceUrl Tailscale 官方发布页(核对来源用)。
  * @returns {string} 纯文本(UTF-8)。
  */
 export function remoteKitGuide(info) {
+  // 令牌不进公开版本:公开版(Release 资产)里那一步只能说"等作者单独发给你"。
+  const tokenStep = info.token
+    ? `  3. 令牌填这一串(**只发给你一个人,请不要转发给任何人**):
+     ${info.token}`
+    : `  3. 令牌:作者会**单独**发给你一串(它等同于密码,请不要转发给任何人),拿到后填进去;`;
   return `轻语 · 异地手机测试包
 ====================================================
 (纯文本,手机和电脑都能直接打开看)
 
-一、这个包里有三样东西
+一、需要的东西有三样
   1. ${info.tailscaleApkFileName} —— 组网工具(Tailscale 官方 Android 客户端)
   2. ${info.qingyuApkFileName} —— 「轻语」手机端 App v${info.version}
   3. 本说明
@@ -187,8 +193,7 @@ export function remoteKitGuide(info) {
   1. 打开 轻语;
   2. 地址填(点地址框下面的「家里(Tailscale)」按钮会自动填上):
      ${info.tailnetUrl}
-  3. 令牌填这一串(**只发给你一个人,请不要转发给任何人**):
-     ${info.token}
+${tokenStep}
   4. 点「连接」,状态变成"已握手 ready"就通了;
   5. 按住「按住说话」说一句,**松开才发送**;上方「她听到的」会显示识别出来的文字
      (用来确认收音对不对),她的声音会自动播出来。
