@@ -667,11 +667,11 @@
       inAudioSegment = true;
       // 边说边播:从现在开始,每收到一段就往后排一段
       nextPlayTime = 0;
-      // 她的声音交给原生播(转成通话用法 → 走耳机);起不来就退回 Web Audio 外放
+      // 她的声音交给原生播(媒体通道 → A2DP 耳机,没耳机才外放);起不来就退回 Web Audio
       nativePlayback = false;
       if (bridgeReady) {
         nativePlayback = native('startPlayback', [audioRate]) === true;
-        logLine(nativePlayback ? '  用原生播放(优先耳机通话链路)' : '  原生播放没起来,退回 Web Audio');
+        logLine(nativePlayback ? '  用原生播放(媒体通道,优先 A2DP 耳机)' : '  原生播放没起来,退回 Web Audio');
       }
       // 对话模式:她开始说话了,先闭麦(否则会把她的声音录回来再发给她)
       if (convOn) { gateConv(true); }

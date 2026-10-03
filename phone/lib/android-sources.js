@@ -1190,42 +1190,34 @@ public class QingyuAudio {
     }
 
     /**
-     * 开始放她的声音。
+     * 开始放她的声音:**一律用媒体用法**(2026-10-03 实测结论,和之前的设计相反)。
      *
-     * 关键判断:**这一轮能不能用通信用法**(用错了就"耳机不出声"):
-     * · 有线/USB 耳麦 → 可以,声音直接进耳麦;
-     * · 我们这轮真的把 SCO 建起来了 → 可以;
-     * · 耳机那路已经被判定为"没有声音"(降级过)→ 不行,走媒体用法 —— 这时 SCO 已经放掉,
-     *   A2DP 恢复,声音从 A2DP 进耳机(音质反而更好);
-     * · 还发现系统里挂着**不是我们开的** SCO(上次异常退出/别的 App 留下的)→ 先清掉它,
-     *   否则它压着 A2DP,媒体也出不去,耳机就彻底没声音。
+     * 之前为了"声音也走耳机那条通话链路",在 SCO 挂着时用通信用法(USAGE_VOICE_COMMUNICATION)
+     * 并把首选设备指到 SCO。vivo V2046A + WH-CH520 上这条路是**哑的**:链路状态
+     * (isBluetoothScoOn()=true)是过期的,声音进了没有音频的链路 —— 用户报"回答还是没有声音",
+     * 而桥那边明明报了 12.75 秒 / 612 018 字节。同一部手机、同一副耳机改走媒体用法时,
+     * 路由是 WH-CH520 [TYPE_8](media),用户确认"耳机里有声音"。
+     * 所以蓝牙一律走媒体:A2DP 连着就是耳机,没耳机就是扬声器,两个都听得到;
+     * 有线/USB 耳麦用媒体用法同样进耳麦,本来也不需要通信用法。
+     *
+     * 唯一要收拾的是**不是我们开的** SCO(上次异常退出/别的 App 留下的):它压着 A2DP,
+     * 不清掉的话媒体声音也出不去。
      *
      * @param rate 采样率。
      * @return 是否开起来了。
      */
     public synchronized boolean startPlayback(int rate) {
-        boolean allowVoice;
-        if (fellBackToPhoneMic) {
-            allowVoice = false;
-        } else if (hasWiredHeadset()) {
-            allowVoice = true;
-        } else if (scoStarted) {
-            allowVoice = true;
-        } else {
-            if (scoOn()) {
-                // 不是我们开的 SCO:清掉,让 A2DP 回来
-                Log.i(TAG, "发现会话外的 SCO,先关掉它再播放");
-                try {
-                    audioManager.setBluetoothScoOn(false);
-                    audioManager.stopBluetoothSco();
-                } catch (Throwable error) {
-                    Log.w(TAG, "关掉遗留 SCO 失败: " + error);
-                }
+        if (!scoStarted && scoOn()) {
+            Log.i(TAG, "发现会话外的 SCO,先关掉它再播放");
+            try {
+                audioManager.setBluetoothScoOn(false);
+                audioManager.stopBluetoothSco();
+            } catch (Throwable error) {
+                Log.w(TAG, "关掉遗留 SCO 失败: " + error);
             }
-            allowVoice = false;
         }
-        Log.i(TAG, "startPlayback(" + rate + ") allowVoice=" + allowVoice);
-        return player.start(rate, allowVoice);
+        Log.i(TAG, "startPlayback(" + rate + ")");
+        return player.start(rate);
     }
 
     /**
@@ -1305,7 +1297,8 @@ public class QingyuAudio {
     }
 
     /** 现在有没有有线/USB 耳麦(这两种走通信用法总是对的)。 */
-    private boolean hasWiredHeadset() {        if (audioManager == null) {
+    private boolean hasWiredHeadset() {
+        if (audioManager == null) {
             return false;
         }
         try {
@@ -3172,13 +3165,14 @@ public class QingyuAudio {
  * 放她的声音:**原生 AudioTrack**,而不是 WebView 里的 Web Audio。
  *
  * 为什么要挪到原生(2026-10-03 用户报"声音从手机扬声器出来了"):
- * 页面的 Web Audio 输出走的是**媒体**流,而对话模式为了拿耳机麦克风一直挂着 SCO 通话链路 ——
+ * 页面的 Web Audio 输出走的是**媒体**流,而对话模式为了拿耳机麦克风会挂 SCO 通话链路 ——
  * SCO 一挂,A2DP(媒体)就被系统挂起,媒体流就没有去耳机的路了,只能从手机扬声器出来。
- * 原生这边用 `USAGE_VOICE_COMMUNICATION` 建 AudioTrack 并把首选设备指到 SCO,
- * 声音就和麦克风走同一条耳机链路(代价是音质变成"通话音质",耳机在 HFP 模式下本来就窄带)。
+ * 原生这边能自己挑输出设备、能算"还剩多久放完",页面才好决定什么时候重新开麦。
  *
- * 没接耳机时不这么干:`USAGE_VOICE_COMMUNICATION` 在没有耳机时会把声音送到**听筒**,
- * 那比扬声器还小声 —— 所以按"当前有没有 SCO/耳机设备"决定用通话用法还是媒体用法。
+ * **用法固定为媒体**(2026-10-03 实测,推翻了当时"用通信用法走耳机链路"的想法):
+ * vivo V2046A + WH-CH520 上通信用法那条路是哑的 —— 桥报了 12.75 秒音频,用户一点声音都没听到;
+ * 同一部手机同一副耳机走媒体用法(路由 WH-CH520 [TYPE_8])时用户确认听到了。
+ * 详见 迁移说明.md 里"她的话没有声音"那一节。
  *
  * @returns {string} QingyuPlayer.java 源码。
  */
@@ -3195,7 +3189,7 @@ import android.util.Base64;
 import android.util.Log;
 
 /**
- * 播放她的 PCM:24 kHz / 单声道 / PCM16,优先走耳机(通话链路)。
+ * 播放她的 PCM:24 kHz / 单声道 / PCM16,**媒体用法**(A2DP 耳机→耳机,没耳机→扬声器)。
  */
 public class QingyuPlayer {
 
@@ -3211,34 +3205,27 @@ public class QingyuPlayer {
     /** 已写入的帧数与"用户听到的"帧数,用来算还剩多久放完。 */
     private volatile long writtenFrames;
     private volatile long drainedFrames;
-    /** 这一轮用的是通话用法(耳机)还是媒体用法(外放)。 */
-    private volatile String usage = "media";
 
     public QingyuPlayer(Context context, AudioManager audioManager) {
         this.context = context;
         this.audioManager = audioManager;
     }
 
-    /** 当前用的是哪种用法(进诊断,便于确认声音到底走哪条路)。 */
+    /** 这一轮用的用法(进诊断,便于确认声音到底走哪条路)。 */
     public String usageName() {
-        return usage;
+        return "media";
     }
 
     /**
      * 开始一轮播放。
      * @param rate 采样率(家里下发的是 24000)。
-     * @param allowVoice 是否允许用通信用法(只有"耳机那边真的能出声"时才该为 true)。
      * @return 是否开起来了。
      */
-    public synchronized boolean start(int rate, boolean allowVoice) {
+    public synchronized boolean start(int rate) {
         stop();
         sampleRate = rate > 0 ? rate : DEFAULT_RATE;
-        AudioDeviceInfo sco = allowVoice ? findVoiceOutput() : null;
-        usage = sco != null ? "voice_communication" : "media";
         AudioAttributes attributes = new AudioAttributes.Builder()
-                .setUsage("voice_communication".equals(usage)
-                        ? AudioAttributes.USAGE_VOICE_COMMUNICATION
-                        : AudioAttributes.USAGE_MEDIA)
+                .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build();
         AudioFormat format = new AudioFormat.Builder()
@@ -3261,15 +3248,11 @@ public class QingyuPlayer {
                 Log.w(TAG, "AudioTrack 初始化失败");
                 return false;
             }
-            if (sco != null) {
-                built.setPreferredDevice(sco);
-            }
             built.play();
             track = built;
             writtenFrames = 0;
             drainedFrames = 0;
-            Log.i(TAG, "播放开始 " + sampleRate + " Hz,用法=" + usage
-                    + ",首选=" + (sco == null ? "无" : describe(sco)));
+            Log.i(TAG, "播放开始 " + sampleRate + " Hz,用法=media");
             return true;
         } catch (Throwable error) {
             Log.w(TAG, "建 AudioTrack 失败: " + error);
@@ -3343,13 +3326,13 @@ public class QingyuPlayer {
     public String routedName() {
         AudioTrack active = track;
         if (active == null) {
-            return "(未在播放," + usage + ")";
+            return "(未在播放,media)";
         }
         try {
             AudioDeviceInfo routed = active.getRoutedDevice();
-            return routed == null ? "(读不到," + usage + ")" : describe(routed) + "(" + usage + ")";
+            return routed == null ? "(读不到,media)" : describe(routed) + "(media)";
         } catch (Throwable error) {
-            return "(读设备失败," + usage + ")";
+            return "(读设备失败,media)";
         }
     }
 
@@ -3381,36 +3364,6 @@ public class QingyuPlayer {
         } catch (Throwable error) {
             return writtenFrames;
         }
-    }
-
-    /** 找一个"该用通信用法"的输出设备。 */
-    private AudioDeviceInfo findVoiceOutput() {
-        if (audioManager == null) {
-            return null;
-        }
-        // 蓝牙 SCO 只有**链路真的挂着**时才算:设备列表里常年挂着一条 SCO 输出设备,
-        // 但没建立时用它做通信用法播放 → 声音进了没有音频的链路 → 用户听到的是"耳机不出声"
-        // (2026-10-04 实测:vivo + WH-CH520 就是这个症状)。
-        boolean scoUp = false;
-        try {
-            scoUp = audioManager.isBluetoothScoOn();
-        } catch (Throwable ignored) {
-            // 读不到就当没挂
-        }
-        try {
-            for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-                int type = device.getType();
-                if (type == AudioDeviceInfo.TYPE_WIRED_HEADSET || type == AudioDeviceInfo.TYPE_USB_HEADSET) {
-                    return device;
-                }
-                if ((type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || type == AudioDeviceInfo.TYPE_BLE_HEADSET) && scoUp) {
-                    return device;
-                }
-            }
-        } catch (Throwable error) {
-            Log.w(TAG, "列输出设备失败: " + error);
-        }
-        return null;
     }
 
     /** 设备 → "名字 [TYPE_x(编号,中文)]"。 */

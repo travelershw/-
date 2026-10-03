@@ -189,14 +189,12 @@ const wantedStrings = [
   ['dev.qingyu.phone.action.STOP', '通知上的停止动作'],
   ['android.permission.POST_NOTIFICATIONS', 'Android 13+ 通知权限常量'],
   ['currentMic', '当前麦克风字段'],
-  // 播放她的话:必须用原生 AudioTrack + 通话用法,否则声音出不了耳机
+  // 播放她的话:必须用原生 AudioTrack + **媒体用法**,否则声音出不了耳机
   ['startPlayback', '原生播放启动'],
   ['writePlayback', '原生播放写数据'],
   ['finishPlayback', '原生播放收尾'],
   ['playbackRemainingMs', '原生播放剩余时长'],
-  // 注意:AudioAttributes.USAGE_VOICE_COMMUNICATION 是 public static final int,
-  // javac 会把它**内联**掉,dex 里就没有这个字段名了 —— 所以查我们自己那个字符串字面量
-  ['voice_communication', '播放用通话用法(进耳机)'],
+  ['(未在播放,media)', '播放用法诊断(媒体)'],
   ['playerRoute', '播放输出设备字段'],
   // 熄屏也要能用:渲染进程不许被冻 + 对话期间拿住 CPU/WiFi
   ['setRendererPriorityPolicy', '渲染进程优先级策略'],
@@ -211,6 +209,18 @@ for (const [needle, label] of wantedStrings) {
     ok(`dex 含 ${needle}`, label);
   } else {
     bad(`dex 含 ${needle}`, label);
+  }
+}
+
+// 播放**不许**再用通信用法(2026-10-03 实测:vivo + WH-CH520 上那条路是哑的,
+// 声音进了过期的 SCO 死链路 → 用户听到"一点声音都没有";媒体用法才听得到)。
+// 这条断言就是防止有人把那条死路再加回 dex。
+const bannedStrings = [['voice_communication', '播放的通信用法(死链路,已删)']];
+for (const [needle, label] of bannedStrings) {
+  if (searchable.includes(Buffer.from(needle, 'utf8'))) {
+    bad(`dex 不含 ${needle}`, label);
+  } else {
+    ok(`dex 不含 ${needle}`, label);
   }
 }
 
