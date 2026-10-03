@@ -679,6 +679,14 @@
       el['f-audio'].textContent = '接收中…';
     } else if (type === 'audio_end') {
       inAudioSegment = false;
+      // 她这一轮说完了:把"她说话期间攒下的半句"清掉 —— 那是她的声音/回声,
+      // 留着会和用户下一句话拼在一起发出去
+      convSpeech = false;
+      convChunks = [];
+      convBytes = 0;
+      convVoicedMs = 0;
+      convPeakDb = -100;
+      convPreRoll = [];
       var row = frame.row || {};
       if (typeof row.first_audio_ms === 'number') { el['s-first'].textContent = row.first_audio_ms + ' ms'; }
       if (typeof row.audio_secs === 'number') { el['s-audio'].textContent = row.audio_secs + ' 秒'; }
@@ -692,6 +700,8 @@
       if (convOn) { ungateAfterPlayback(); }
     } else if (type === 'error') {
       setStatus('家里报错: ' + frame.message, 'bad');
+      // 出错要让用户一眼看见:不然他只看到"正在听",以为是自己没被听见
+      setHint('这一句没成:' + frame.message + ' —— 再说一遍?');
       // 出错了也要收尾:单句还锁;对话模式重新开麦,否则这一轮之后就一直哑着
       if (!convOn) { native('endLiveAudio', []); }
       if (convOn) { gateConv(false); }
@@ -958,7 +968,6 @@
   /** 该在什么时刻重新开麦(音频回调据此判断,不依赖定时器)。 */
   var convGateUntil = 0;
   var convUiTimer = null;
-  var convSince = 0;
   /** 本底噪声(环境安静时的读数):阈值跟着它走,免得在吵的地方一直触发。 */
   var convFloor = -60;
 
@@ -970,18 +979,30 @@
   var CONV_MAX_SEGMENT_MS = 15000;   // 一句最长 15 秒,到点也发
   var CONV_FLOOR_MARGIN = 8;         // 阈值 = 本底 + 8 dB
   var CONV_MIN_THRESHOLD = -45;      // 阈值不低于这个(太灵敏会一直触发)
-  var CONV_REPLY_TIMEOUT_MS = 20000; // 她一直不回也要解封,不然麦克风就"哑"了
+  var CONV_REPLY_TIMEOUT_MS = 30000; // 她一直不回也要解封,不然麦克风就"哑"了
+                                     // (实测她第一段音频最晚 11.7 秒才到;她**还在说**时这个超时不算数,
+                                     //  见 gateConv 里的"她还在说,继续闭麦")
   var CONV_SILENT_DBFS = -52;        // 整段峰值低于这个 = 根本没收到声音(别发,别让她瞎猜)
   var CONV_SILENT_LIMIT = 3;         // 连着这么多段没声音就弹强提示
   /** 这一段听到过的最响电平,以及"连着几段没声音"。 */
   var convPeakDb = -100;
   var convSilentStreak = 0;
 
-  /** 对话模式的按钮文案/计时。 */
+  /** 对话模式的按钮文案:只说"现在在干什么",不再显示一个只增不减的累计秒数。 */
   function updateConvUi() {
     if (!convOn) { return; }
-    var secs = ((Date.now() - convSince) / 1000).toFixed(0);
-    el.ptt.textContent = convGate ? '对话中(她说呢)' : ('结束对话 · 正在听 ' + secs + ' 秒');
+    if (convGate) {
+      el.ptt.textContent = inAudioSegment ? '对话中(她说呢)' : '对话中(等她说)';
+      return;
+    }
+    if (convSpeech) {
+      // 这一句正在录:显示它有多长,收句/丢弃后自然归零(以前显示的是本次对话累计秒数,
+      // 用户看到的是"计时不重置")
+      el.ptt.textContent = '结束对话 · 听到你说 '
+        + ((Date.now() - convStartedAt) / 1000).toFixed(1) + ' 秒';
+      return;
+    }
+    el.ptt.textContent = '结束对话 · 正在听';
   }
 
   /** 报告切句阈值(排障时一眼看得出为什么没触发)。 */
@@ -1014,7 +1035,6 @@
     convVoicedMs = 0;
     convPreRoll = [];
     convFloor = -60;
-    convSince = Date.now();
     el.ptt.className = 'big live';
     updateConvUi();
     // 拿住 CPU 与 WiFi:熄屏后系统会节流页面、把网络省电化,拿住才真的"一直在听"
@@ -1061,6 +1081,10 @@
     convPeakDb = -100;
     if (bytes === 0 || voicedMs < CONV_MIN_VOICED_MS) {
       logLine('对话模式:这一小段太短(' + voicedMs + ' ms),丢掉');
+      if (bytes > 0) {
+        // 说出来一点又被丢,用户会以为"她不回我" —— 必须在页面上说清是"没听够"
+        setHint('这一句只听到 ' + voicedMs + ' 毫秒(太短),没发出去 —— 再说一遍?');
+      }
       return;
     }
     // 整段峰值太低 = 麦克风根本没收到人声(耳机没供麦/手机麦被挡/麦克风被别的 App 占着)。
@@ -1103,9 +1127,18 @@
     if (convGateTimer) { clearTimeout(convGateTimer); convGateTimer = null; }
     if (!gated) { convGateUntil = 0; }
     if (gated) {
-      // 她一直不回(报错、超时)也要解封,不然麦克风就永远哑着
+      // 她一直不回(报错、超时)也要解封,不然麦克风就永远哑着。
+      // **但"她还在说"不算不回**:她这段音频还在往这边流(哪怕已经流了 60 秒),
+      // 就不能开麦 —— 否则麦克风会把她的声音录回去、当成"你说的话"送去识别,
+      // 结果是无意义的段落 + 识别失败,用户看到的是"我说了话它却不回我"
+      // (2026-10-03 实测:她回了 68.92 秒,20 秒超时在中间就把麦开了)。
       convGateTimer = setTimeout(function () {
         convGateTimer = null;
+        if (inAudioSegment) {
+          logLine('对话模式:她还在说,继续闭麦(等回答超时先不算)');
+          gateConv(true);
+          return;
+        }
         convGate = false;
         logLine('对话模式:等回答超时,先继续听');
       }, CONV_REPLY_TIMEOUT_MS);
@@ -1146,8 +1179,8 @@
     // 熄屏后定时器会被压到 1 分钟一次,但音频回调照常每 100 ms 来一次 ——
     // 心跳和"重新开麦"都挂在这条线上,才不会被系统的定时器节流拖死。
     sendHeartbeat('音频');
-    if (convGate) {
-      if (convGateUntil && Date.now() >= convGateUntil) {
+    if (convGate || inAudioSegment) {
+      if (convGate && convGateUntil && Date.now() >= convGateUntil) {
         convGateUntil = 0;
         gateConv(false);
         convPreRoll = [];
