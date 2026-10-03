@@ -773,6 +773,8 @@
   var chunks = [];
   var recordedBytes = 0;
   var recordStartedAt = 0;
+  /** 这一句里听到过的最响电平(判断"是不是根本没收到声音")。 */
+  var peakDb = -100;
   var routeTimer = null;
   var sendTimer = null;
 
@@ -815,6 +817,7 @@
     chunks = [];
     recordedBytes = 0;
     recordStartedAt = Date.now();
+    peakDb = -100;
     recording = true;
     // 单句也说一句就走:这几十秒同样要拿住 CPU/WiFi(页面被节流的话,松手那一刻发不出去)
     native('beginLiveAudio', []);
@@ -881,6 +884,15 @@
       logLine('录音共 0 字节,不发送');
       return;
     }
+    // 和对话模式同一条保险:整段几乎没声音就别发,并说清是什么麦在录
+    if (peakDb < CONV_SILENT_DBFS) {
+      var current = (lastRoute || {}).currentMic || '未知';
+      setHint('这一段没听到声音(峰值 ' + peakDb.toFixed(0) + ' dBFS,当前麦克风:' + current
+        + '):检查耳机是否在供麦,或手机麦有没有被挡住/占用。');
+      logLine('单句:峰值只有 ' + peakDb.toFixed(1) + ' dBFS(< ' + CONV_SILENT_DBFS + '),不发送');
+      native('endLiveAudio', []);
+      return;
+    }
     var pcm = pure.mergeChunks(chunks);
     var frame = pure.buildUtteranceFrame(pcm, UPLINK_RATE);
     el['s-up'].textContent = frame.secs + ' 秒 / ' + (pcm.length / 1024).toFixed(1) + ' KB';
@@ -932,6 +944,11 @@
   var CONV_FLOOR_MARGIN = 8;         // 阈值 = 本底 + 8 dB
   var CONV_MIN_THRESHOLD = -45;      // 阈值不低于这个(太灵敏会一直触发)
   var CONV_REPLY_TIMEOUT_MS = 20000; // 她一直不回也要解封,不然麦克风就"哑"了
+  var CONV_SILENT_DBFS = -52;        // 整段峰值低于这个 = 根本没收到声音(别发,别让她瞎猜)
+  var CONV_SILENT_LIMIT = 3;         // 连着这么多段没声音就弹强提示
+  /** 这一段听到过的最响电平,以及"连着几段没声音"。 */
+  var convPeakDb = -100;
+  var convSilentStreak = 0;
 
   /** 对话模式的按钮文案/计时。 */
   function updateConvUi() {
@@ -1007,14 +1024,34 @@
     var voicedMs = convVoicedMs;
     var bytes = convBytes;
     var pieces = convChunks;
+    var peak = convPeakDb;
     // 下一句的开头:留最后几块,避免把第一个字切掉
     convPreRoll = pieces.slice(-CONV_PREROLL_CHUNKS);
     convSpeech = false;
     convChunks = [];
     convBytes = 0;
     convVoicedMs = 0;
+    convPeakDb = -100;
     if (bytes === 0 || voicedMs < CONV_MIN_VOICED_MS) {
       logLine('对话模式:这一小段太短(' + voicedMs + ' ms),丢掉');
+      return;
+    }
+    // 整段峰值太低 = 麦克风根本没收到人声(耳机没供麦/手机麦被挡/麦克风被别的 App 占着)。
+    // 这种"静音段"发出去只会让她瞎猜回一句「嗯」,所以直接不发,并把原因写到页面上。
+    if (peak < CONV_SILENT_DBFS) {
+      convSilentStreak += 1;
+      logLine('对话模式:这一段几乎没声音(峰值 ' + peak.toFixed(1) + ' dBFS < '
+        + CONV_SILENT_DBFS + '),不发 · 第 ' + convSilentStreak + ' 次');
+      var route = lastRoute || {};
+      if (convSilentStreak >= CONV_SILENT_LIMIT) {
+        setHint('没听到声音(峰值只有 ' + peak.toFixed(0) + ' dBFS,' + convSilentStreak
+          + ' 次了)。当前麦克风:' + (route.currentMic || '未知')
+          + ' —— 检查耳机是否在供麦(蓝牙是否连着、有没有被别的手机占着通话)、手机麦有没有被挡住或占用。');
+        el['r-verdict'].textContent = '没听到声音:检查' + (route.currentMic || '麦克风');
+        el['r-verdict'].className = 'verdict bad';
+      } else {
+        setHint('这一段没听到声音(峰值 ' + peak.toFixed(0) + ' dBFS):说大声一点,或者检查麦克风。');
+      }
       return;
     }
     if (!pure) { return; }
@@ -1025,6 +1062,7 @@
       return;
     }
     // 发出去就闭麦,等她把话说完 —— 否则会把她的声音录回来(还会被识别成文字)
+    convSilentStreak = 0;
     gateConv(true);
     socket.send(JSON.stringify(frame.json));
     socket.send(frame.binary);
@@ -1095,6 +1133,7 @@
     if (dbfs > threshold) {
       convLastVoiceAt = now;
       convVoicedMs += CONV_CHUNK_MS;
+      if (dbfs > convPeakDb) { convPeakDb = dbfs; }
       if (!convSpeech) {
         convSpeech = true;
         convStartedAt = now;
@@ -1292,7 +1331,9 @@
       el.levelBar.style.width = (pure ? pure.levelToRatio(dbfs) * 100 : 0).toFixed(0) + '%';
       el.levelText.textContent = dbfs.toFixed(1) + ' dBFS';
       el['s-level'].textContent = dbfs.toFixed(1) + ' dBFS';
-      if (convOn) { convOnLevel(dbfs); }
+      if (convOn) { convOnLevel(dbfs); return; }
+      // 单句模式:记下这一句里听到过的最响电平(发之前用它判断"是不是根本没声音")
+      if (recording && dbfs > peakDb) { peakDb = dbfs; }
     },
     onRecordingStopped: function (reason) {
       // 三种来源:到时长上限(autoStop)、录音根本没能开始(失败原因)、一般收尾

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Android 工程与版本号的单一来源。
  *
  * 这里只有字符串:manifest、Gradle 脚本、资源。`tools/gen-android.js` 把它们写进
@@ -15,8 +15,8 @@
 export const APPLICATION_ID = 'dev.qingyu.phone';
 /** 应用名(桌面图标下的名字)。 */
 export const APP_LABEL = '轻语';
-export const VERSION_NAME = '0.2.5';
-export const VERSION_CODE = 7;
+export const VERSION_NAME = '0.2.7';
+export const VERSION_CODE = 9;
 
 /**
  * 分发用的 Tailscale 地址(不带 token,页面里的「家里(Tailscale)」预设用它)。

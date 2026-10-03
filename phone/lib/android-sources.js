@@ -1135,6 +1135,14 @@ public class QingyuAudio {
     /** HFP 代理:getProfileProxy 是异步的,必须保存监听器并等 onServiceConnected。 */
     private volatile BluetoothHeadset headsetProxy;
     private volatile boolean headsetProxyRequested;
+    /** 最近一次真的收到音频数据的时刻(用来发现"路由看起来好了、其实没有声音")。 */
+    private volatile long lastDataAt;
+    /** 已经为此降级过一次就不再重复降级(免得来回切换)。 */
+    private volatile boolean fellBackToPhoneMic;
+    /** 给耳机多久时间送第一块数据;超过就认为它那路是死的。 */
+    private static final long SILENT_ROUTE_GRACE_MS = 1500;
+    /** 低于这个电平就当作"数字静音"(全零块)—— 真麦克风再安静也有本底噪声。 */
+    private static final double SILENT_FLOOR_DBFS = -90.0;
 
     /**
      * @param context Activity(取 AudioManager 要用)。
@@ -1268,16 +1276,28 @@ public class QingyuAudio {
         recording = true;
         autoStopped = false;
         routeReported = false;
+        lastDataAt = 0;
+        fellBackToPhoneMic = false;
         worker = new Thread(this::loop, "qingyu-audio");
         worker.start();
 
         boolean routed = routeToHeadset();
         if (!routed) {
+            // **耳机不成也要继续录**:以前这里直接 stop() 并报错返回,结果用户对着耳机说话
+            // 时 App 一个字节都不录、页面立刻弹"录音没起来" —— 2026-10-04 用户报的
+            // "无法识别我说话"就是这个死路(auto 方式下耳机路由失败 → 干脆不录)。
+            // 现在的做法:如实报出耳机为什么不行,然后**用手机麦接着录**,由页面把
+            // 「当前使用的麦克风」显示清楚。宁可音质差一点,也不能让人白说。
             String detail = attemptLog.isEmpty() ? "" : ":" + join("; ", attemptLog);
-            stop();
-            fail("麦克风没能切到耳机(方式 " + scoMode + ")" + detail
-                    + " —— 请点『SCO 试验』看时间线,并把『SCO 方式』换成另一种再试(华为上多半要用『老接口』)");
-            return false;
+            restoreRoute();
+            fellBackToPhoneMic = true;
+            lastAttempt = "耳机路由失败(方式 " + scoMode + ")" + detail + " → 改用手机麦";
+            try {
+                listener.onRouteAttempt(lastAttempt);
+            } catch (Throwable error) {
+                Log.w(TAG, "报降级失败: " + error);
+            }
+            Log.w(TAG, "耳机路由失败,改用手机麦:" + lastAttempt);
         }
 
         Log.i(TAG, "开始录音,路由 " + routeJson());
@@ -2228,8 +2248,7 @@ public class QingyuAudio {
     }
 
     /** 释放 AudioRecord(不碰路由)。 */
-    private void releaseRecord() {
-        AudioRecord active = record;
+    private void releaseRecord() {        AudioRecord active = record;
         record = null;
         if (active == null) {
             return;
@@ -2243,6 +2262,35 @@ public class QingyuAudio {
             active.release();
         } catch (Throwable ignored) {
             // 同上
+        }
+    }
+
+    /**
+     * 检查"耳机那路是不是在装死":SCO / 通话设备都报成功,但一个字节的音频都没来。
+     *
+     * 为什么必须查:2026-10-04 实测到这种状态(vivo V2046A + WH-CH520)——
+     * scoOn=true、routedDevice=TYPE_BLUETOOTH_SCO(7),可 AudioRecord **永远没有数据**。
+     * 页面那边表现为电平停在 -100.0、一个回调都没有,用户说什么都没反应,而 App 还以为
+     * "耳机路由成功"。这里发现之后直接切回手机麦,并把原因交给页面显示 ——
+     * 宁可音质差一点,也不能让他对着耳机白说。
+     */
+    private void checkSilentHeadset() {
+        if (fellBackToPhoneMic || !recording || lastDataAt != 0) {
+            return;
+        }
+        boolean routedToHeadset = scoStarted || scoOn();
+        if (!routedToHeadset) {
+            return;
+        }
+        fellBackToPhoneMic = true;
+        String reason = "耳机那路收不到声音(SCO 建起来了但零数据)";
+        Log.w(TAG, reason + " → 自动改用手机麦");
+        restoreRoute();
+        lastAttempt = "自动降级:" + reason + " → 手机麦";
+        try {
+            listener.onRouteAttempt(lastAttempt);
+        } catch (Throwable error) {
+            Log.w(TAG, "报降级失败: " + error);
         }
     }
 
@@ -2261,21 +2309,50 @@ public class QingyuAudio {
             if (active == null) {
                 break;
             }
+            // 单块出错不能把整条录音线程带走:以前没有这层保护,循环里任何异常都会让线程
+            // 静默退出 —— 页面表现为"电平停在某个值再也不动"(2026-10-04 排查时踩到)。
+            try {
             int read;
             try {
-                read = active.read(chunk, filled, chunk.length - filled);
+                // **非阻塞**读:以前用阻塞读,遇到"SCO 建起来了但耳机不送数据"时
+                // 会一直卡在这里 —— 页面一个回调都收不到(电平停在 -100),表现就是
+                // "说什么都没反应"(2026-10-04 实测:vivo + WH-CH520,耳机麦那路零数据)。
+                // 非阻塞之后我们能发现"这么久没数据",从而自动降级到手机麦。
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    read = active.read(chunk, filled, chunk.length - filled, AudioRecord.READ_NON_BLOCKING);
+                } else {
+                    read = active.read(chunk, filled, chunk.length - filled);
+                }
             } catch (Throwable error) {
                 Log.w(TAG, "AudioRecord.read 异常: " + error);
                 break;
             }
             if (read <= 0) {
+                // 没有数据:顺手检查"耳机一直在装死"这件事(SCO 建起来了却收不到任何声音)
+                if (SystemClock.elapsedRealtime() - startedAt > SILENT_ROUTE_GRACE_MS) {
+                    checkSilentHeadset();
+                }
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
                 continue;
             }
             filled += read;
             if (filled >= chunk.length) {
                 byte[] block = new byte[CHUNK_BYTES];
                 System.arraycopy(chunk, 0, block, 0, CHUNK_BYTES);
-                listener.onLevel(levelDbfs(block));
+                double level = levelDbfs(block);
+                // 数据在流不等于有声音:SCO 那路可能一直送**数字零**(全零块的电平就是 -100)。
+                // 只有电平高于"数字静音线"才算真的收到音频;否则也可能是耳机在装死。
+                if (level > SILENT_FLOOR_DBFS) {
+                    lastDataAt = SystemClock.elapsedRealtime();
+                } else if (SystemClock.elapsedRealtime() - startedAt > SILENT_ROUTE_GRACE_MS) {
+                    checkSilentHeadset();
+                }
+                listener.onLevel(level);
                 listener.onChunk(Base64.encodeToString(block, Base64.NO_WRAP));
                 // 第一块到手说明 SCO 已经建起来了,这时再报一次路由:设备名最有参考价值
                 if (!routeReported) {
@@ -2287,6 +2364,16 @@ public class QingyuAudio {
                     }
                 }
                 filled = 0;
+            }
+            } catch (Throwable error) {
+                // 这一块处理出错:记一笔、歇 10 ms 继续,不能让整条录音线程退出
+                Log.w(TAG, "录音循环单块异常(已忽略继续): " + error);
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
 
