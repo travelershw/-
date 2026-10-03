@@ -35,6 +35,12 @@ CACHE_DIR = Path(get_astrbot_plugin_data_path()) / "tts_cache"
 MAX_CACHE_FILES = 20
 # QQ 语音别太长：超了就截（并告诉主人截了）
 MAX_CHARS = 200
+# 一次请求最多合成多少字：超过就按标点切成多段、逐段合成（**不是**丢掉）。
+# 2026-10-04 实测：她回了一长串餐厅清单（约 250 字），流式那条路没做任何长度处理，
+# 整段请求被云端拒掉 → 一个字的声音都没有（用户报"长回答没有声音"）。
+SPEECH_CHUNK_CHARS = 200
+# 一条回复最多念多少字（再长就截断，免得念两分钟）
+SPEECH_TOTAL_CHARS = 600
 CACHE_SECONDS = 5.0
 CONNECT_TIMEOUT = 20
 READ_TIMEOUT = 60
@@ -172,6 +178,51 @@ def prepare_text(raw: str) -> tuple[str, str]:
     if len(text) <= MAX_CHARS:
         return text, ""
     return text[:MAX_CHARS], f"太长了，我只念前 {MAX_CHARS} 字"
+
+
+def split_for_speech(text: str, limit: int = SPEECH_CHUNK_CHARS) -> list[str]:
+    """把一段话按标点切成若干小段,每段单独发一次合成请求。
+
+    为什么必须切:云端合成的**单次请求有长度限制**,一段 250 字的回复会被整段拒掉,
+    结果是一个字的声音都没有(2026-10-04 实测:"长回答没有声音")。
+    切成小段之后长回复会被**完整念出来**,而不是失败或者只剩前 200 字。
+
+    Args:
+        text: 想说的话(可以带换行/列表符号)。
+        limit: 每段最多多少字。
+
+    Returns:
+        段落列表;空输入返回空列表。相邻的短片段会尽量合并,免得一顿一顿的。
+    """
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return []
+    pieces: list[str] = []
+    current = ""
+    for char in cleaned:
+        current += char
+        # 句末标点、列表符号后断开;单段过长也硬断(避免一整句没有标点)
+        if char in "。！？!?；;，" or len(current) >= limit:
+            pieces.append(current)
+            current = ""
+    if current:
+        pieces.append(current)
+    merged: list[str] = []
+    for piece in pieces:
+        if merged and len(merged[-1]) + len(piece) <= limit:
+            merged[-1] += piece
+        else:
+            merged.append(piece)
+    # 总长兜底:一条回复最多念 SPEECH_TOTAL_CHARS 字(再长要念两分钟,不如只念开头)
+    capped: list[str] = []
+    total = 0
+    for piece in merged:
+        if total >= SPEECH_TOTAL_CHARS:
+            break
+        room = SPEECH_TOTAL_CHARS - total
+        capped.append(piece[:room])
+        total += len(piece)
+    return [piece for piece in capped if piece]
 
 
 def wrap_wav(pcm: bytes, sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
@@ -442,11 +493,14 @@ async def synthesize(text: str, extra: dict | None = None) -> tuple[bytes, str, 
     wanted = str(values["format"])
     audio = bytearray()
     billed = 0
-    async for chunk, chunk_billed in _pcm_stream(text, extra):
-        if chunk:
-            audio.extend(chunk)
-        if chunk_billed:
-            billed = chunk_billed
+    # 长回复**切段逐段合成**,拼成一条完整音频(见 split_for_speech 的说明)
+    spoken = split_for_speech(text)
+    for piece in spoken:
+        async for chunk, chunk_billed in _pcm_stream(piece, extra):
+            if chunk:
+                audio.extend(chunk)
+            if chunk_billed:
+                billed = chunk_billed
     if wanted in ("wav", "pcm"):
         # 自己封 WAV：扩展名与魔数都对得上，AstrBot 就不会去找系统 ffmpeg
         return (
@@ -470,8 +524,10 @@ async def stream(text: str, extra: dict | None = None):
     Raises:
         TTSError: When it is not configured, unreachable, or the service refuses.
     """
-    async for chunk, billed in _pcm_stream(text, extra):
-        yield chunk, billed
+    # 长回复切段逐段流出去(整段超过云端单次请求上限会被整段拒掉,一个字都念不出来)
+    for piece in split_for_speech(text):
+        async for chunk, billed in _pcm_stream(piece, extra):
+            yield chunk, billed
 
 
 def sample_rate() -> int:
