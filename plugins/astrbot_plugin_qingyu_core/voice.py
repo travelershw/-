@@ -9,7 +9,8 @@
 
 1. **会话必须显式开过**（``/语音 自动 开``）——默认谁都不发，免得对不认识的人突然出声；
 2. **只私聊**：群聊一律文字；
-3. **长度 ≤ 60 字**：再长就该看，不该听；
+3. **长度 ≤ 60 字**：再长就该看，不该听（设备通道例外，上限 600 字：那边是切段合成的，
+   见 :data:`DEVICE_MAX_CHARS`）；
 4. **夜里（23:00–08:00）只有你刚发的是语音才回语音**——对等回应，不主动吵人；
 5. **冷却 10 分钟**、**每会话每天 20 条**、**全局每天 300 条**（钱的天花板）；
 6. **内容打分 ≥ 0.5**：问候/关心/哄人加分，带数字/链接/问句减分（见 :func:`score`）。
@@ -53,6 +54,11 @@ DEFAULTS: dict = {
     # 测试时长度上限放到服务的单次上限（200 字），而不是平时的 60
     "test_max_chars": 200,
 }
+# 设备通道（眼镜 / 手机）单条最多念多少字。**必须**和 `tts.SPEECH_TOTAL_CHARS`（600）对齐：
+# 那边是"按标点切段、总长封顶"的实现，这边是"长到不该念"的判定，两边不对齐就会出现
+# **判定为不念 → 文字有了、声音一个字都没有**（2026-10-03 实测：306 字的回答 → 0 字节音频，
+# 用户连着两轮报"回答还是没有声音"，就是被这里的 200 字门槛挡掉的）。
+DEVICE_MAX_CHARS = 600
 # 有温度的话：问候、关心、哄人、祝福
 WARM_WORDS = (
     "晚安",
@@ -557,6 +563,9 @@ def decide(
         return Decision(False, "群聊不发语音（要测就发「/语音 测试 开」）")
     length = len(text.strip())
     limit = int(values["test_max_chars"] if relaxed else values["max_chars"])
+    if device:
+        # 设备通道的上限跟"能念出来的总长"对齐（见 DEVICE_MAX_CHARS 的说明）
+        limit = max(limit, DEVICE_MAX_CHARS)
     if length > limit:
         return Decision(False, f"太长了（{length} 字 > {limit}）")
     if not relaxed and quiet and not user_was_voice:
