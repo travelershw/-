@@ -618,7 +618,7 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
     @JavascriptInterface
     public boolean startPlayback(int sampleRate) {
         try {
-            boolean ok = audio.player().start(sampleRate);
+            boolean ok = audio.startPlayback(sampleRate);
             Log.i(TAG, "startPlayback(" + sampleRate + ") → " + ok);
             return ok;
         } catch (Throwable error) {
@@ -1041,6 +1041,7 @@ import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioRecord;
+import android.media.AudioRecordingConfiguration;
 import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.SystemClock;
@@ -1139,6 +1140,8 @@ public class QingyuAudio {
     private volatile long lastDataAt;
     /** 已经为此降级过一次就不再重复降级(免得来回切换)。 */
     private volatile boolean fellBackToPhoneMic;
+    /** "被别的 App 静音"这件事只报一次。 */
+    private volatile boolean silenceReported;
     /** 给耳机多久时间送第一块数据;超过就认为它那路是死的。 */
     private static final long SILENT_ROUTE_GRACE_MS = 1500;
     /** 低于这个电平就当作"数字静音"(全零块)—— 真麦克风再安静也有本底噪声。 */
@@ -1163,9 +1166,141 @@ public class QingyuAudio {
         }
     }
 
-    /** @return 播放器(页面通过桥调用它放她的声音)。 */
+    /** 播放器(页面通过桥调用它放她的声音)。 */
     public QingyuPlayer player() {
         return player;
+    }
+
+    /**
+     * 开始放她的声音。
+     *
+     * 关键判断:**这一轮能不能用通信用法**(用错了就"耳机不出声"):
+     * · 有线/USB 耳麦 → 可以,声音直接进耳麦;
+     * · 我们这轮真的把 SCO 建起来了 → 可以;
+     * · 耳机那路已经被判定为"没有声音"(降级过)→ 不行,走媒体用法 —— 这时 SCO 已经放掉,
+     *   A2DP 恢复,声音从 A2DP 进耳机(音质反而更好);
+     * · 还发现系统里挂着**不是我们开的** SCO(上次异常退出/别的 App 留下的)→ 先清掉它,
+     *   否则它压着 A2DP,媒体也出不去,耳机就彻底没声音。
+     *
+     * @param rate 采样率。
+     * @return 是否开起来了。
+     */
+    public synchronized boolean startPlayback(int rate) {
+        boolean allowVoice;
+        if (fellBackToPhoneMic) {
+            allowVoice = false;
+        } else if (hasWiredHeadset()) {
+            allowVoice = true;
+        } else if (scoStarted) {
+            allowVoice = true;
+        } else {
+            if (scoOn()) {
+                // 不是我们开的 SCO:清掉,让 A2DP 回来
+                Log.i(TAG, "发现会话外的 SCO,先关掉它再播放");
+                try {
+                    audioManager.setBluetoothScoOn(false);
+                    audioManager.stopBluetoothSco();
+                } catch (Throwable error) {
+                    Log.w(TAG, "关掉遗留 SCO 失败: " + error);
+                }
+            }
+            allowVoice = false;
+        }
+        Log.i(TAG, "startPlayback(" + rate + ") allowVoice=" + allowVoice);
+        return player.start(rate, allowVoice);
+    }
+
+    /**
+     * 现在哪些 App 在用麦克风、我们有没有被系统静音。
+     *
+     * 为什么需要它:2026-10-04 实测到"数据一直在流、但每一块都是数字零"的状态 ——
+     * 那是 Android 对**被抢占的录音方**的标准做法(另一个 App 拿着麦克风时,后来者收到静音)。
+     * 有这一行就能一眼分清是"耳机没供麦"还是"麦克风被别人占着",不用再猜。
+     *
+     * @return 一行摘要,例如 "会话 1234(我们,录音中) | 会话 5678(别的 App)"。
+     */
+    private String activeRecordersText() {
+        if (audioManager == null) {
+            return "(读不到)";
+        }
+        try {
+            int ours = ourSessionId();
+            int others = 0;
+            StringBuilder sb = new StringBuilder();
+            for (AudioRecordingConfiguration cfg : audioManager.getActiveRecordingConfigurations()) {
+                if (sb.length() > 0) {
+                    sb.append(" | ");
+                }
+                int session = cfg.getClientAudioSessionId();
+                boolean mine = ours != 0 && session == ours;
+                if (!mine) {
+                    others += 1;
+                }
+                sb.append("会话 ").append(session);
+                sb.append(mine ? "(我们," : "(别的 App,");
+                sb.append(cfg.isClientSilenced() ? "被静音)" : "录音中)");
+            }
+            if (sb.length() == 0) {
+                return "(没有 App 在录音)";
+            }
+            if (others > 0) {
+                sb.append("  ← 另有 ").append(others).append(" 个 App 也在用麦克风");
+            }
+            return sb.toString();
+        } catch (Throwable error) {
+            return "(读取失败: " + error.getClass().getSimpleName() + ")";
+        }
+    }
+
+    /** 我们自己是不是正被系统静音(另一个 App 拿着麦克风时的典型状态)。 */
+    private boolean isOurRecordingSilenced() {
+        if (audioManager == null) {
+            return false;
+        }
+        int ours = ourSessionId();
+        if (ours == 0) {
+            return false;
+        }
+        try {
+            for (AudioRecordingConfiguration cfg : audioManager.getActiveRecordingConfigurations()) {
+                if (cfg.getClientAudioSessionId() == ours) {
+                    return cfg.isClientSilenced();
+                }
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "查录音静音状态失败: " + error);
+        }
+        return false;
+    }
+
+    /** 我们这条 AudioRecord 的 session id(0 表示现在没在录)。 */
+    private int ourSessionId() {
+        AudioRecord active = record;
+        if (active == null) {
+            return 0;
+        }
+        try {
+            return active.getAudioSessionId();
+        } catch (Throwable error) {
+            return 0;
+        }
+    }
+
+    /** 现在有没有有线/USB 耳麦(这两种走通信用法总是对的)。 */
+    private boolean hasWiredHeadset() {        if (audioManager == null) {
+            return false;
+        }
+        try {
+            for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int type = device.getType();
+                if (type == AudioDeviceInfo.TYPE_WIRED_HEADSET || type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                    return true;
+                }
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "查有线耳麦失败: " + error);
+        }
+        return false;
     }
 
     /** @return 是否正在录音。 */
@@ -1276,8 +1411,10 @@ public class QingyuAudio {
         recording = true;
         autoStopped = false;
         routeReported = false;
-        lastDataAt = 0;
+        // 以"此刻"作为基准:开录后 1.5 秒内没听到任何真实声音,就认为这条路由是死的
+        lastDataAt = SystemClock.elapsedRealtime();
         fellBackToPhoneMic = false;
+        silenceReported = false;
         worker = new Thread(this::loop, "qingyu-audio");
         worker.start();
 
@@ -1408,6 +1545,8 @@ public class QingyuAudio {
             // 她的声音现在从哪个设备出来、用的哪种用法(不用猜,看这两条)
             json.put("playerRoute", player.routedName());
             json.put("playerUsage", player.usageName());
+            // 现在谁在用麦克风、我们是不是被系统静音了 —— "收到全零"最常见的原因就是这个
+            json.put("activeRecorders", activeRecordersText());
             // 一整段可直接粘贴的纯文本:页面的「复制诊断」按钮就用它
             json.put("diagnostics", diagnostics());
             json.put("hint", hint());
@@ -2275,23 +2414,125 @@ public class QingyuAudio {
      * 宁可音质差一点,也不能让他对着耳机白说。
      */
     private void checkSilentHeadset() {
-        if (fellBackToPhoneMic || !recording || lastDataAt != 0) {
+        if (fellBackToPhoneMic || !recording) {
             return;
         }
-        boolean routedToHeadset = scoStarted || scoOn();
-        if (!routedToHeadset) {
+        // 最近 1.5 秒内收到过真实声音就不算"耳机装死"。
+        // 注意:这个判断必须看"最近",不能看"曾经" —— SCO 是开录约 1 秒后才接管的,
+        // 开头那 1 秒手机麦的真实声音会让"曾经"型标记永远为真,降级就永远不会触发。
+        if (SystemClock.elapsedRealtime() - lastDataAt <= SILENT_ROUTE_GRACE_MS) {
+            return;
+        }
+        // 先分清"我们被系统静音"这一种:那不是耳机的问题,而是**另一个 App 正拿着麦克风**
+        // (Android 对后来者就是给静音)。这时该提示用户关掉那个 App,而不是怪耳机。
+        if (isOurRecordingSilenced()) {
+            if (!silenceReported) {
+                silenceReported = true;
+                lastAttempt = "另一个 App 正在用麦克风(我们只收到静音) → 关掉微信语音/录音机之类再试";
+                Log.w(TAG, lastAttempt);
+                try {
+                    listener.onRouteAttempt(lastAttempt);
+                } catch (Throwable error) {
+                    Log.w(TAG, "报静音原因失败: " + error);
+                }
+            }
+            return;
+        }
+        if (!routedToBluetoothInput()) {
             return;
         }
         fellBackToPhoneMic = true;
-        String reason = "耳机那路收不到声音(SCO 建起来了但零数据)";
+        String reason = "耳机那路收不到声音(SCO 建起来了但只有数字零)";
         Log.w(TAG, reason + " → 自动改用手机麦");
         restoreRoute();
+        // **必须重开 AudioRecord**:只放掉 SCO 是不够的 —— 那条录音实例还停在旧路由上,
+        // 会继续吐数字零(实测:降级后 routedDevice 已显示内置麦,电平却还是 -100)。
+        restartRecordForPhoneMic();
         lastAttempt = "自动降级:" + reason + " → 手机麦";
         try {
             listener.onRouteAttempt(lastAttempt);
         } catch (Throwable error) {
             Log.w(TAG, "报降级失败: " + error);
         }
+    }
+
+    /** 降级到手机麦时重开录音实例,让它按"现在这支麦"重新路由。 */
+    private void restartRecordForPhoneMic() {
+        AudioRecord old = record;
+        record = null;
+        if (old != null) {
+            try {
+                old.stop();
+            } catch (Throwable ignored) {
+                // 已停
+            }
+            try {
+                old.release();
+            } catch (Throwable ignored) {
+                // 已释放
+            }
+        }
+        AudioRecord fresh = openRecord();
+        if (fresh == null) {
+            Log.w(TAG, "重开 AudioRecord 失败");
+            return;
+        }
+        try {
+            fresh.startRecording();
+        } catch (Throwable error) {
+            Log.w(TAG, "重开录音失败: " + error);
+        }
+        if (fresh.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+            Log.w(TAG, "重开的 AudioRecord 没进入录音状态");
+            try {
+                fresh.release();
+            } catch (Throwable ignored) {
+                // 忽略
+            }
+            return;
+        }
+        record = fresh;
+        Log.i(TAG, "已重开 AudioRecord,改用手机麦");
+    }
+
+    /**
+     * 这一轮的输入是不是真的挂在蓝牙上。
+     *
+     * 三个线索任一成立就算:scoStarted / isBluetoothScoOn / 通信设备是蓝牙设备。
+     * 只看前两个会漏 —— 实测到过 setCommunicationDevice(SCO) 成功、可 isBluetoothScoOn()
+     * 却是 false 的状态(那时页面显示 SCO=false,降级判断被跳过,用户就一直对着静音说话)。
+     *
+     * @return 挂在蓝牙输入上为 true。
+     */
+    private boolean routedToBluetoothInput() {
+        if (scoStarted) {
+            return true;
+        }
+        if (scoOn()) {
+            return true;
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                AudioDeviceInfo comm = audioManager.getCommunicationDevice();
+                if (comm != null) {
+                    int type = comm.getType();
+                    if (type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || type == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "查通信设备失败: " + error);
+        }
+        try {
+            AudioDeviceInfo preferred = scoDevice;
+            if (preferred != null && preferred.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+            // 拿不到就算没有
+        }
+        return false;
     }
 
     /** 录音线程:攒满 100 ms 就回一块,顺带回电平;到本次时长上限自动停。 */
@@ -2968,13 +3209,13 @@ public class QingyuPlayer {
     /**
      * 开始一轮播放。
      * @param rate 采样率(家里下发的是 24000)。
+     * @param allowVoice 是否允许用通信用法(只有"耳机那边真的能出声"时才该为 true)。
      * @return 是否开起来了。
      */
-    public synchronized boolean start(int rate) {
+    public synchronized boolean start(int rate, boolean allowVoice) {
         stop();
         sampleRate = rate > 0 ? rate : DEFAULT_RATE;
-        // 有 SCO/耳机就用通话用法(声音进耳机);没有就用媒体用法(走扬声器,别掉进听筒)
-        AudioDeviceInfo sco = findScoOutput();
+        AudioDeviceInfo sco = allowVoice ? findVoiceOutput() : null;
         usage = sco != null ? "voice_communication" : "media";
         AudioAttributes attributes = new AudioAttributes.Builder()
                 .setUsage("voice_communication".equals(usage)
@@ -3124,17 +3365,27 @@ public class QingyuPlayer {
         }
     }
 
-    /** 找一个 SCO 输出设备(耳机在通话模式下就是它)。 */
-    private AudioDeviceInfo findScoOutput() {
+    /** 找一个"该用通信用法"的输出设备。 */
+    private AudioDeviceInfo findVoiceOutput() {
         if (audioManager == null) {
             return null;
+        }
+        // 蓝牙 SCO 只有**链路真的挂着**时才算:设备列表里常年挂着一条 SCO 输出设备,
+        // 但没建立时用它做通信用法播放 → 声音进了没有音频的链路 → 用户听到的是"耳机不出声"
+        // (2026-10-04 实测:vivo + WH-CH520 就是这个症状)。
+        boolean scoUp = false;
+        try {
+            scoUp = audioManager.isBluetoothScoOn();
+        } catch (Throwable ignored) {
+            // 读不到就当没挂
         }
         try {
             for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
                 int type = device.getType();
-                if (type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                        || type == AudioDeviceInfo.TYPE_WIRED_HEADSET
-                        || type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                if (type == AudioDeviceInfo.TYPE_WIRED_HEADSET || type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                    return device;
+                }
+                if ((type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || type == AudioDeviceInfo.TYPE_BLE_HEADSET) && scoUp) {
                     return device;
                 }
             }
