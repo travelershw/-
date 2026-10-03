@@ -508,17 +508,36 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
     // ---------------------------------------------------------------- 录音
 
     /**
-     * 开始录音(16 kHz / 单声道 / PCM16,强制走蓝牙耳机麦)。
+     * 开始录音(16 kHz / 单声道 / PCM16,强制走蓝牙耳机麦) —— 单句模式,30 秒上限。
      * @return 是否真的开起来了;false 时原因会通过 onRecordingStopped 送到页面。
      */
     @JavascriptInterface
     public boolean startRecording() {
         try {
-            boolean started = audio.start();
+            boolean started = audio.start(30);
             Log.i(TAG, "startRecording → " + started);
             return started;
         } catch (Throwable error) {
             Log.w(TAG, "startRecording 失败: " + error);
+            return false;
+        }
+    }
+
+    /**
+     * 开始**对话模式**:连续听,上限放宽到 10 分钟。
+     *
+     * 页面按静音把这一整段切成一句句自动发送(切句在页面侧做,原生只负责持续供数据);
+     * 上限只是兜底,退出对话模式时页面会自己 stopRecording。
+     * @return 是否真的开起来了。
+     */
+    @JavascriptInterface
+    public boolean startConversation() {
+        try {
+            boolean started = audio.start(600);
+            Log.i(TAG, "startConversation → " + started);
+            return started;
+        } catch (Throwable error) {
+            Log.w(TAG, "startConversation 失败: " + error);
             return false;
         }
     }
@@ -728,8 +747,8 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
 
     @Override
     public void onAutoStop() {
-        // 到 30 秒上限被强制停掉:页面要据此把"正在录音"的界面收回来
-        Log.i(TAG, "录音到达 30 秒上限,已自动停止");
+        // 到本次时长上限被强制停掉:页面要据此把"正在录音"的界面收回来
+        Log.i(TAG, "录音到达本次时长上限,已自动停止");
         callJs("onRecordingStopped", "'timeout'");
     }
 
@@ -873,7 +892,8 @@ import java.util.Locale;
  * 16 kHz / 单声道 / PCM16 录音,强制走蓝牙耳机麦。
  *
  * 每满 100 ms(3200 字节)回调一块 PCM 与一次电平,页面把它们拼起来封 WAV。
- * 30 秒上限是兜底:用户忘了松手时不能让麦克风一直开着。
+ * 时长上限是兜底:单句 30 秒、对话模式 10 分钟(由 start(seconds) 传入),
+ * 免得忘了关时麦克风一直开着。
  *
  * 另外提供一个独立的 probeSco():不录音,只把蓝牙通话链路按时间线跑一遍并逐步记录,
  * 用来回答"系统到底给不给三方 App 这条链路"。
@@ -897,6 +917,7 @@ public class QingyuAudio {
     public static final int CHANNELS = 1;
     /** 100 ms @ 16 kHz / 单声道 / 16 bit。 */
     private static final int CHUNK_BYTES = 3200;
+    /** 单句模式的默认上限(秒)。对话模式由 start(600) 放宽,页面退出时自己停。 */
     private static final int MAX_SECONDS = 30;
     private static final String TAG = "Qingyu";
 
@@ -925,6 +946,8 @@ public class QingyuAudio {
     private Thread worker;
     private volatile boolean recording;
     private volatile boolean autoStopped;
+    /** 本次录音的时长上限(秒):单句 30,对话模式 600。 */
+    private volatile int maxSeconds = MAX_SECONDS;
     private boolean modeChanged;
     private boolean scoStarted;
     private AudioDeviceInfo scoDevice;
@@ -1025,9 +1048,20 @@ public class QingyuAudio {
      * @return 是否真的开起来了(权限、设备、路由任一环节失败都返回 false)。
      */
     public synchronized boolean start() {
+        return start(MAX_SECONDS);
+    }
+
+    /**
+     * 带时长上限的启动。
+     *
+     * @param seconds 本次录音的上限秒数(单句 30;对话模式 600,页面退出时自己停)。
+     * @return 是否真的开起来了。
+     */
+    public synchronized boolean start(int seconds) {
         if (recording) {
             return true;
         }
+        maxSeconds = Math.max(5, Math.min(3600, seconds));
         if (audioManager == null) {
             fail("系统 AudioManager 不可用");
             return false;
@@ -2034,14 +2068,14 @@ public class QingyuAudio {
         }
     }
 
-    /** 录音线程:攒满 100 ms 就回一块,顺带回电平;到 30 秒自动停。 */
+    /** 录音线程:攒满 100 ms 就回一块,顺带回电平;到本次时长上限自动停。 */
     private void loop() {
         byte[] chunk = new byte[CHUNK_BYTES];
         int filled = 0;
         long startedAt = SystemClock.elapsedRealtime();
 
         while (recording) {
-            if (SystemClock.elapsedRealtime() - startedAt >= MAX_SECONDS * 1000L) {
+            if (SystemClock.elapsedRealtime() - startedAt >= maxSeconds * 1000L) {
                 autoStopped = true;
                 break;
             }

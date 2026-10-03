@@ -175,14 +175,14 @@
 <body>
 
 <h1>轻语</h1>
-<div class="sub">手机端 v<span id="appVersion">…</span> · 点击说话 · 拍照给她看 · 她用自己的声音回答</div>
+<div class="sub">手机端 v<span id="appVersion">…</span> · 对话模式 · 拍照给她看 · 她用自己的声音回答</div>
 
 <section id="guideCard" class="card" style="display:none">
   <h2>三步用起来(第一次使用)</h2>
   <div class="steps">
     <div><b>①</b> 手机装 <b>Tailscale</b> 并登录<b>和家里电脑同一个账号</b>(在外面也能连)。手机和电脑在<b>同一个 WiFi</b> 时这步可以跳过。</div>
     <div><b>②</b> 填服务器地址:点下面的「家里(Tailscale)」;同一个 WiFi 就点「同一个 WiFi」,再把 IP 改成电脑的局域网地址。令牌通常留空。</div>
-    <div><b>③</b> 点「连接」。状态显示"已握手 ready"就通了 —— 点一下「点击说话」开始,再点一下结束并发送。</div>
+    <div><b>③</b> 点「连接」。状态显示"已握手 ready"就通了 —— 点「开始对话」就能连着聊:你说话停顿一下它自动发出去,她说的时候自动闭麦;再点一下结束。</div>
   </div>
   <div class="row">
     <button id="guideClose" class="ghost">知道了,不再显示</button>
@@ -243,17 +243,20 @@
 <section class="card">
   <h2>说话与拍照</h2>
   <div class="row">
-    <button id="ptt" class="big">点击说话</button>
+    <button id="ptt" class="big">开始对话</button>
+  </div>
+  <div class="row">
+    <button id="oneShot" class="big ghost">说一句</button>
     <button id="camera" class="big ghost">拍照</button>
   </div>
   <div class="meter"><div id="levelBar"></div></div>
   <div class="meterline"><span id="levelText">-100.0 dBFS</span><span id="recordText">未录音</span></div>
-  <div id="placeholder" class="hint">点击说话:点一下开始,再点一下结束并发送(16 kHz 单声道 WAV,最长 30 秒)&nbsp;·&nbsp;拍照:拍完自动缩放上传</div>
+  <div id="placeholder" class="hint"><b>开始对话</b>:点一下就一直听着,你说话停顿一下它自动发出去,她说的时候自动闭麦 —— 再点一下结束。&nbsp;·&nbsp;<b>说一句</b>:点一下开始、再点一下结束并发送(最长 30 秒)。</div>
 </section>
 
 <section class="card">
   <h2>她听到的 / 她说的</h2>
-  <div id="heard" class="hint">还没有收到 you 帧。点「点击说话」说一句,这里会显示识别结果、电平和耗时。</div>
+  <div id="heard" class="hint">还没有收到 you 帧。点「开始对话」或「说一句」说句话,这里会显示识别结果、电平和耗时。</div>
   <div id="dialogue"></div>
   <div class="facts" style="margin-top:10px">
     <div><span>本轮上行时长</span><span id="s-up">—</span></div>
@@ -300,7 +303,7 @@
   var pure = window.QingyuPure || null;
 
   var el = {};
-  ['address', 'token', 'connect', 'disconnect', 'status', 'handshake', 'ptt', 'camera',
+  ['address', 'token', 'connect', 'disconnect', 'status', 'handshake', 'ptt', 'oneShot', 'camera',
    'placeholder', 'textInput', 'sendText', 'dialogue', 'heard', 'log', 'clearLog', 'ping',
    'levelBar', 'levelText', 'recordText', 'refreshRoute', 'requestBt', 'r-verdict', 'r-rows',
    'r-last', 'scoMode', 'allowTier3', 'copyDiag', 'probeSco', 'r-probe', 'batteryHint',
@@ -642,6 +645,8 @@
       inAudioSegment = true;
       // 边说边播:从现在开始,每收到一段就往后排一段
       nextPlayTime = 0;
+      // 对话模式:她开始说话了,先闭麦(否则会把她的声音录回来再发给她)
+      if (convOn) { gateConv(true); }
       logLine('  开始收语音 ' + audioRate + ' Hz / ' + (frame.channels || 1) + ' 声道');
       el['f-audio'].textContent = '接收中…';
     } else if (type === 'audio_end') {
@@ -651,8 +656,12 @@
       if (typeof row.audio_secs === 'number') { el['s-audio'].textContent = row.audio_secs + ' 秒'; }
       logLine('  语音结束 reason=' + (frame.reason || '?') + ',共 ' + audioSegments + ' 段');
       el['f-audio'].textContent = audioSegments > 0 ? '已播 ' + audioSegments + ' 段' : '空闲';
+      // 对话模式:等这段(含排队中还没播完的)放完再重新开麦
+      if (convOn) { ungateAfterPlayback(); }
     } else if (type === 'error') {
       setStatus('家里报错: ' + frame.message, 'bad');
+      // 对话模式下报错也要开麦,否则这一轮之后就一直哑着
+      if (convOn) { gateConv(false); }
     }
   }
 
@@ -723,16 +732,19 @@
   var sendTimer = null;
 
   /**
-   * 开始说话:开原生录音(16 kHz 单声道,强制走蓝牙耳机麦)。
+   * 说一句(单句模式):开原生录音(16 kHz 单声道,强制走蓝牙耳机麦)。
    *
-   * 2026-10-03 起按钮改成**开关式**(点一下开始、再点一下结束并发送):按住说话的
-   * 那套手势在耳机/走路场景里不好用,而且"松手"这个动作容易被系统手势抢走。
-   * 安全网:原生那边 30 秒上限会强制停并自动发送(`onRecordingStopped('timeout')`)。
+   * 按钮是**开关式**(点一下开始、再点一下结束并发送)。想连续聊用「开始对话」;
+   * 单句模式留给"一次只说一句"的场合(比如环境吵、或者只想问一句)。
    */
   function startTalking() {
     if (recording) { return; }
+    if (convOn) {
+      setHint('对话模式开着呢:直接说就行;想单句说,先点一下「结束对话」');
+      return;
+    }
     if (!bridgeReady) {
-      setHint('点击说话:在浏览器里打开没有原生桥,录不了音');
+      setHint('说一句:在浏览器里打开没有原生桥,录不了音');
       logLine('没有原生桥,startRecording 不可用');
       return;
     }
@@ -759,8 +771,8 @@
     recordedBytes = 0;
     recordStartedAt = Date.now();
     recording = true;
-    el.ptt.className = 'big live';
-    el.ptt.textContent = '结束并发送';
+    el.oneShot.className = 'big live';
+    el.oneShot.textContent = '结束并发送';
     el.recordText.textContent = '录音中…';
     logLine('开始录音(16 kHz 单声道 PCM16)');
     refreshRoute();
@@ -780,8 +792,8 @@
     recording = false;
     native('stopRecording', []);
     if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
-    el.ptt.className = 'big';
-    el.ptt.textContent = '点击说话';
+    el.oneShot.className = 'big ghost';
+    el.oneShot.textContent = '说一句';
     el.recordText.textContent = '已停(' + (recordedBytes / 1024).toFixed(1) + ' KB)';
     if (autoReason) { logLine('录音被自动停止: ' + autoReason); }
     // **先把发送排上,再去显示路由**:2026-10-03 踩过 —— 显示路由的代码抛了异常,
@@ -810,7 +822,7 @@
     var secs = ((Date.now() - recordStartedAt) / 1000).toFixed(1);
     el.recordText.textContent = '录音中 ' + secs + ' 秒 / ' + (recordedBytes / 1024).toFixed(1) + ' KB';
     // 开关式:按钮上直接显示秒数,一眼看得出"正在录",不用去找下面那行小字
-    el.ptt.textContent = '结束并发送 (' + secs + ' 秒)';
+    el.oneShot.textContent = '结束并发送 (' + secs + ' 秒)';
   }
 
   /** 把这一轮攒下的 PCM 封成 WAV,按协议发出去。 */
@@ -833,6 +845,217 @@
     socket.send(JSON.stringify(frame.json));
     socket.send(frame.binary);
     logLine('→ utterance + wav ' + frame.binary.byteLength + ' 字节(含 44 字节头)');
+  }
+
+  // ---------------------------------------------------------------- 对话模式
+  // 开关一开就**连续听**:靠音量把这一长段切成一句句,每句自动发出去;
+  // 她说的时候闭麦(不然会把她的声音录回来),她说完自动接着听。
+  // 切句在页面侧做是有意的:原生只管持续供 100 ms 一块的 PCM,协议一个字都不用改。
+
+  /** 对话模式开关。 */
+  var convOn = false;
+  /** 她正在说话(或正在等她的回答):这期间不收数据,避免录回她自己的声音。 */
+  var convGate = false;
+  /** 当前这一句是否已经"起了头"(有人说话)。 */
+  var convSpeech = false;
+  /** 当前这一句攒下的 PCM 块。 */
+  var convChunks = [];
+  var convBytes = 0;
+  var convVoicedMs = 0;
+  var convStartedAt = 0;
+  var convLastVoiceAt = 0;
+  /** 最近几块留作下一句的开头(不然会切掉第一个字)。 */
+  var convPreRoll = [];
+  var convGateTimer = null;
+  var convUiTimer = null;
+  var convSince = 0;
+  /** 本底噪声(环境安静时的读数):阈值跟着它走,免得在吵的地方一直触发。 */
+  var convFloor = -60;
+
+  /** 切句参数(单位:dBFS / 毫秒)。 */
+  var CONV_CHUNK_MS = 100;
+  var CONV_PREROLL_CHUNKS = 3;       // 300 ms
+  var CONV_MIN_VOICED_MS = 400;      // 短于此当成咳嗽/碰撞,不发送
+  var CONV_SILENCE_MS = 800;         // 静音这么久就认为这句说完了
+  var CONV_MAX_SEGMENT_MS = 15000;   // 一句最长 15 秒,到点也发
+  var CONV_FLOOR_MARGIN = 8;         // 阈值 = 本底 + 8 dB
+  var CONV_MIN_THRESHOLD = -45;      // 阈值不低于这个(太灵敏会一直触发)
+  var CONV_REPLY_TIMEOUT_MS = 20000; // 她一直不回也要解封,不然麦克风就"哑"了
+
+  /** 对话模式的按钮文案/计时。 */
+  function updateConvUi() {
+    if (!convOn) { return; }
+    var secs = ((Date.now() - convSince) / 1000).toFixed(0);
+    el.ptt.textContent = convGate ? '对话中(她说呢)' : ('结束对话 · 正在听 ' + secs + ' 秒');
+  }
+
+  /** 报告切句阈值(排障时一眼看得出为什么没触发)。 */
+  function convThreshold() {
+    return Math.max(CONV_MIN_THRESHOLD, convFloor + CONV_FLOOR_MARGIN);
+  }
+
+  /** 开对话模式。 */
+  function startConversation() {
+    if (convOn) { return; }
+    if (!bridgeReady) {
+      setHint('对话模式:在浏览器里打开没有原生桥,录不了音');
+      return;
+    }
+    if (recording) {
+      setHint('手上还有一句没结束:先点一下「说一句」把它发掉,再开对话模式');
+      return;
+    }
+    var started = native('startConversation', []);
+    if (started !== true) {
+      logLine('startConversation 返回 ' + started + ',等原生的失败原因');
+      native('requestAudioPermission', []);
+      return;
+    }
+    convOn = true;
+    convGate = false;
+    convSpeech = false;
+    convChunks = [];
+    convBytes = 0;
+    convVoicedMs = 0;
+    convPreRoll = [];
+    convFloor = -60;
+    convSince = Date.now();
+    el.ptt.className = 'big live';
+    updateConvUi();
+    logLine('对话模式已开启(连续听,静音 ' + CONV_SILENCE_MS + ' ms 切句)');
+    setHint('对话模式:说就行,停顿一下我自动发出去;她说话时自动闭麦。再点一次结束。');
+    convUiTimer = setInterval(updateConvUi, 1000);
+    refreshRoute();
+  }
+
+  /** 收尾并关掉对话模式(把正在说的这半句也发出去)。 */
+  function stopConversation(reason) {
+    if (!convOn) { return; }
+    convOn = false;
+    if (convUiTimer) { clearInterval(convUiTimer); convUiTimer = null; }
+    if (convGateTimer) { clearTimeout(convGateTimer); convGateTimer = null; }
+    if (convSpeech) { closeConvSegment('关闭时收尾'); }
+    convGate = false;
+    convSpeech = false;
+    convPreRoll = [];
+    native('stopRecording', []);
+    el.ptt.className = 'big';
+    el.ptt.textContent = '开始对话';
+    el.recordText.textContent = '已停';
+    logLine('对话模式已关闭' + (reason ? '(' + reason + ')' : ''));
+    setHint('对话模式已关闭。点「开始对话」继续连续聊,或点「说一句」只说一句。');
+    refreshRoute();
+  }
+
+  /** 把当前这一句封成 WAV 发出去。 */
+  function closeConvSegment(why) {
+    var voicedMs = convVoicedMs;
+    var bytes = convBytes;
+    var pieces = convChunks;
+    // 下一句的开头:留最后几块,避免把第一个字切掉
+    convPreRoll = pieces.slice(-CONV_PREROLL_CHUNKS);
+    convSpeech = false;
+    convChunks = [];
+    convBytes = 0;
+    convVoicedMs = 0;
+    if (bytes === 0 || voicedMs < CONV_MIN_VOICED_MS) {
+      logLine('对话模式:这一小段太短(' + voicedMs + ' ms),丢掉');
+      return;
+    }
+    if (!pure) { return; }
+    var pcm = pure.mergeChunks(pieces);
+    var frame = pure.buildUtteranceFrame(pcm, UPLINK_RATE);
+    if (!wsOpen()) {
+      logLine('对话模式:没连上家里,这 ' + frame.secs + ' 秒丢了');
+      return;
+    }
+    // 发出去就闭麦,等她把话说完 —— 否则会把她的声音录回来(还会被识别成文字)
+    gateConv(true);
+    socket.send(JSON.stringify(frame.json));
+    socket.send(frame.binary);
+    el['s-up'].textContent = frame.secs + ' 秒 / ' + (pcm.length / 1024).toFixed(1) + ' KB';
+    logLine('对话模式:这一句 ' + frame.secs + ' 秒(' + voicedMs + ' ms 有声,' + why + ')已发送');
+  }
+
+  /** 闭麦/开麦:闭麦期间 onAudio/onLevel 一律不参与切句。 */
+  function gateConv(gated) {
+    convGate = gated;
+    if (convGateTimer) { clearTimeout(convGateTimer); convGateTimer = null; }
+    if (gated) {
+      // 她一直不回(报错、超时)也要解封,不然麦克风就永远哑着
+      convGateTimer = setTimeout(function () {
+        convGateTimer = null;
+        convGate = false;
+        logLine('对话模式:等回答超时,先继续听');
+      }, CONV_REPLY_TIMEOUT_MS);
+    }
+    updateConvUi();
+  }
+
+  /** 她这段语音放完了(含排队里还没放完的部分),过一小会儿再开麦。 */
+  function ungateAfterPlayback() {
+    if (!convOn) { return; }
+    var queuedMs = 0;
+    if (audioContext && nextPlayTime) {
+      queuedMs = Math.max(0, (nextPlayTime - audioContext.currentTime) * 1000);
+    }
+    if (convGateTimer) { clearTimeout(convGateTimer); convGateTimer = null; }
+    convGateTimer = setTimeout(function () {
+      convGateTimer = null;
+      if (!convOn) { return; }
+      gateConv(false);
+      convPreRoll = [];
+      logLine('对话模式:她说完' + (queuedMs > 200 ? '(含排队 ' + Math.round(queuedMs) + ' ms)' : '') + ',继续听');
+    }, queuedMs + 400);
+  }
+
+  /**
+   * 对话模式下的电平回调:判断"有人说话"与"这句说完了"。
+   * @param {number} dbfs 这一块(100 ms)的 dBFS。
+   */
+  function convOnLevel(dbfs) {
+    if (!convOn || convGate) { return; }
+    var now = Date.now();
+    var threshold = convThreshold();
+    if (dbfs > threshold) {
+      convLastVoiceAt = now;
+      convVoicedMs += CONV_CHUNK_MS;
+      if (!convSpeech) {
+        convSpeech = true;
+        convStartedAt = now;
+        convChunks = convPreRoll.slice();
+        convBytes = convChunks.reduce(function (sum, item) { return sum + item.length; }, 0);
+        convPreRoll = [];
+        logLine('对话模式:听到声音(阈值 ' + threshold.toFixed(0) + ' dBFS),开始这一句');
+      }
+      return;
+    }
+    // 安静:顺便把本底噪声往下带(只降不升,避免人声把阈值抬高)
+    if (dbfs < convFloor) { convFloor = dbfs; } else { convFloor = convFloor * 0.995 + dbfs * 0.005; }
+    if (!convSpeech) { return; }
+    if (now - convLastVoiceAt >= CONV_SILENCE_MS) {
+      closeConvSegment('静音 ' + CONV_SILENCE_MS + ' ms');
+      return;
+    }
+    if (now - convStartedAt >= CONV_MAX_SEGMENT_MS) {
+      closeConvSegment('到 ' + (CONV_MAX_SEGMENT_MS / 1000) + ' 秒上限');
+    }
+  }
+
+  /**
+   * 对话模式下的数据回调:攒块 / 维护预滚。
+   * @param {string} base64Pcm 这一块 PCM 的 base64。
+   */
+  function convOnAudio(base64Pcm) {
+    if (!convOn || convGate || !pure) { return; }
+    var bytes = pure.base64ToBytes(base64Pcm);
+    if (convSpeech) {
+      convChunks.push(bytes);
+      convBytes += bytes.length;
+      return;
+    }
+    convPreRoll.push(bytes);
+    if (convPreRoll.length > CONV_PREROLL_CHUNKS) { convPreRoll.shift(); }
   }
 
   // ---------------------------------------------------------------- 拍照
@@ -980,7 +1203,9 @@
   // 万一 WebView 不允许给注入对象加属性,回调也不会静默丢失。
   var hooks = {
     onAudio: function (base64Pcm) {
-      // 松开之后那一小块尾巴也会到这里:一律收下,别丢字
+      // 对话模式和单句模式共用这条回调:对话模式自己攒块(按句发送)
+      if (convOn) { convOnAudio(base64Pcm); return; }
+      // 结束之后那一小块尾巴也会到这里:一律收下,别丢字
       if (!pure) { return; }
       var bytes = pure.base64ToBytes(base64Pcm);
       chunks.push(bytes);
@@ -992,12 +1217,25 @@
       el.levelBar.style.width = (pure ? pure.levelToRatio(dbfs) * 100 : 0).toFixed(0) + '%';
       el.levelText.textContent = dbfs.toFixed(1) + ' dBFS';
       el['s-level'].textContent = dbfs.toFixed(1) + ' dBFS';
+      if (convOn) { convOnLevel(dbfs); }
     },
     onRecordingStopped: function (reason) {
-      // 三种来源:30 秒到顶(autoStop)、录音根本没能开始(失败原因)、一般收尾
+      // 三种来源:到时长上限(autoStop)、录音根本没能开始(失败原因)、一般收尾
       if (reason === 'timeout') {
+        if (convOn) {
+          logLine('对话模式到了 10 分钟上限,自动结束');
+          stopConversation('到 10 分钟上限');
+          return;
+        }
         setHint('到了 30 秒上限,已自动停止并发送');
         stopTalking(reason);
+        return;
+      }
+      if (convOn) {
+        // 对话模式下录音被中断(权限/被抢占):如实报出来并退出模式
+        setHint('对话模式中断:' + reason);
+        logLine('对话模式中断:' + reason);
+        stopConversation(reason);
         return;
       }
       if (recording) {
@@ -1079,12 +1317,17 @@
     }
   }
 
-  // ---------------------------------------------------------------- 其它按钮
-  // 说话按钮是**开关式**(2026-10-03 由"按住说话"改来):
-  //   点一下开始录,再点一下结束并发送 —— 走路/戴耳机时按住不放很别扭,
-  //   而且"松手"这个动作常被系统手势或来电抢走,导致一段话白说。
-  //   忘记关也没关系:原生 30 秒上限会强制停并自动发送(按钮上一直显示秒数)。
+  // 说话按钮:
+  //   「开始对话」= 开关式**连续对话**(开着一句句自动发,她说话时自动闭麦);
+  //   「说一句」  = 开关式单句(点一下开始、再点一下结束并发送),留给只想问一句的场合。
   el.ptt.addEventListener('click', function () {
+    if (convOn) {
+      stopConversation('手动关闭');
+    } else {
+      startConversation();
+    }
+  });
+  el.oneShot.addEventListener('click', function () {
     if (recording) {
       stopTalking();
     } else {
