@@ -762,17 +762,29 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
     public boolean capturePhoto(String text) {
         Activity activity = activityRef.get();
         if (activity == null) {
+            cameraError("页面还在,但宿主 Activity 不在了(请重新打开 App)");
             return false;
         }
         try {
             if (activity.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
                 Log.w(TAG, "capturePhoto 缺少 CAMERA 权限");
+                cameraError("还没有相机权限:在系统弹窗里允许,或在设置里给轻语开相机权限");
                 return false;
             }
             return camera.capture(text);
         } catch (Throwable error) {
             Log.w(TAG, "capturePhoto 失败: " + error);
+            cameraError("拍照调用出错:" + error.getClass().getSimpleName() + " " + error.getMessage());
             return false;
+        }
+    }
+
+    /** 把拍照失败的原因送回页面(页面会写进帧日志并显示出来)。 */
+    private void cameraError(String reason) {
+        try {
+            callJs("onCameraError", "'" + escapeJs(reason) + "'");
+        } catch (Throwable error) {
+            Log.w(TAG, "报拍照失败原因出错: " + error);
         }
     }
 
@@ -939,6 +951,12 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
     @Override
     public void onPhoto(String base64Jpeg, String text) {
         callJs("onPhoto", "'" + base64Jpeg + "','" + escapeJs(text) + "'");
+    }
+
+    @Override
+    public void onCameraError(String reason) {
+        // 拍照没能拉起来的真正原因(权限/没有相机应用/上一次卡住…),页面会写进日志并显示
+        callJs("onCameraError", "'" + escapeJs(reason) + "'");
     }
 
     /**
@@ -3441,6 +3459,17 @@ public class QingyuCamera {
     /** 拍完的回调。用户取消时 base64 是空字符串,不是异常。 */
     public interface Listener {
         void onPhoto(String base64Jpeg, String text);
+
+        /**
+         * 拍照**没能拉起来**的原因(要能直接照做)。
+         *
+         * 为什么单独一条:以前失败只返回 false,页面只能说"取消或失败",用户完全不知道
+         * 是权限、是没有相机应用、还是"上一次拍照卡住了" —— 2026-10-04 排查拍照功能时
+         * 就是卡在这里(实际原因:上一次的 pending 没清,之后每次点都静默返回 false)。
+         *
+         * @param reason 给人看的一句话。
+         */
+        void onCameraError(String reason);
     }
 
     /** 拍照请求码,由 MainActivity 转发回来。 */
@@ -3474,8 +3503,14 @@ public class QingyuCamera {
      */
     public boolean capture(String text) {
         if (pending) {
-            Log.w(TAG, "上一次拍照还没结束,忽略这次请求");
-            return false;
+            // 上一次拍照没等到返回(相机被杀、进程被回收、页面重载都可能导致)。
+            // 以前这里直接返回 false 且不清状态 → **之后每次点拍照都是静默失败**,
+            // 用户看到的就是"拍照功能坏了"。现在:如实说明 + 把状态重置,下一次能正常用。
+            Log.w(TAG, "上一次拍照还没结束,重置后重试");
+            pending = false;
+            cleanup(pendingFile);
+            pendingFile = null;
+            listener.onCameraError("上一次拍照没有正常返回(已自动重置)。请再点一次「拍照」");
         }
         pendingText = text == null ? "" : text;
         File file = null;
@@ -3484,6 +3519,7 @@ public class QingyuCamera {
             File dir = new File(activity.getCacheDir(), "images");
             if (!dir.exists() && !dir.mkdirs()) {
                 Log.w(TAG, "建不了图片目录 " + dir);
+                listener.onCameraError("建不了图片缓存目录,拍照没法存: " + dir);
                 listener.onPhoto("", pendingText);
                 return false;
             }
@@ -3501,11 +3537,13 @@ public class QingyuCamera {
         } catch (ActivityNotFoundException error) {
             Log.w(TAG, "这台设备没有相机应用: " + error);
             cleanup(file);
+            listener.onCameraError("这台设备上没有能拍照的应用(系统相机被删了或被禁用)");
             listener.onPhoto("", pendingText);
             return false;
         } catch (Throwable error) {
             Log.w(TAG, "拉起相机失败: " + error);
             cleanup(file);
+            listener.onCameraError("拉起相机失败:" + error.getClass().getSimpleName() + " " + error.getMessage());
             listener.onPhoto("", pendingText);
             return false;
         }

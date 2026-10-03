@@ -1382,6 +1382,13 @@
       // 三档路由尝试的实测结果,一行一条:现场一眼就能看出哪档通、哪档不通
       logLine('路由尝试 → ' + text);
     },
+    onCameraError: function (reason) {
+      // 原生把"为什么没拉起来"说清楚了(权限/没有相机应用/上一次卡住),原样给用户看
+      logLine('拍照失败:' + reason);
+      setHint('拍照失败:' + reason);
+      el['r-verdict'].textContent = '拍照失败:' + reason;
+      el['r-verdict'].className = 'verdict bad';
+    },
     onPhoto: function (base64Jpeg, text) {
       if (!base64Jpeg) {
         logLine('拍照取消或失败(空 base64)');
