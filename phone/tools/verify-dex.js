@@ -198,6 +198,12 @@ const wantedStrings = [
   // javac 会把它**内联**掉,dex 里就没有这个字段名了 —— 所以查我们自己那个字符串字面量
   ['voice_communication', '播放用通话用法(进耳机)'],
   ['playerRoute', '播放输出设备字段'],
+  // 熄屏也要能用:渲染进程不许被冻 + 对话期间拿住 CPU/WiFi
+  ['setRendererPriorityPolicy', '渲染进程优先级策略'],
+  ['beginLiveAudio', '对话期间拿唤醒锁'],
+  ['endLiveAudio', '说完释放唤醒锁'],
+  ['qingyu:talk', 'CPU 唤醒锁标签'],
+  ['qingyu:wifi', '高性能 WiFi 锁标签'],
   ['findWiredHeadsetInput', '有线/USB 耳麦优先'],
 ];
 for (const [needle, label] of wantedStrings) {

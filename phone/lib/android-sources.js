@@ -38,7 +38,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.WindowManager;
@@ -57,6 +59,7 @@ import android.widget.Toast;
  */
 public class MainActivity extends Activity {
 
+    private static final String TAG = "Qingyu";
     /** 打包进 APK 的本地页面。 */
     private static final String LOCAL_PAGE = "file:///android_asset/index.html";
 
@@ -107,7 +110,39 @@ public class MainActivity extends Activity {
         setContentView(webView);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
+        // 别让系统在后台/熄屏时把渲染进程冻掉。
+        //
+        // 为什么必须这么做:对话模式的切句、发帧、播放全在页面 JS 里,而熄屏后 Chromium 会把
+        // 后台 WebView 的渲染进程降级并节流 —— 2026-10-04 实测:手机黑屏 70 秒,页面的
+        // 25 秒心跳只跳了一次(间隔被拉到 48.8 秒)。表现就是"插着线看着屏幕时好使,
+        // 拔了线放兜里就不响"。RENDERER_PRIORITY_IMPORTANT + waivedWhenNotVisible=false
+        // 就是官方给这种情况的开关(API 26+,低版本没有这个策略,只能靠前台服务 + 唤醒锁)。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+        }
+
         loadLocalPage();
+    }
+
+    /**
+     * 熄屏/切后台时不要把 WebView 停下来。
+     *
+     * 与上面的渲染优先级策略配套:光有优先级还不够,Chromium 在宿主 Activity 停止后
+     * 仍可能暂停页面定时器;这里主动 onResume + resumeTimers 把页面留在"运行中"。
+     * 代价是后台会多耗一点电,但对话模式本来就需要麦克风、CPU、WiFi 一直在线;
+     * 真正长期耗电的是对话模式本身,拿锁/放锁由 beginLiveAudio()/endLiveAudio() 管。
+     */
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (webView != null) {
+            try {
+                webView.resumeTimers();
+                webView.onResume();
+            } catch (Throwable error) {
+                Log.w(TAG, "保持页面运行失败: " + error);
+            }
+        }
     }
 
     /**
@@ -219,7 +254,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.PowerManager;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
@@ -259,6 +296,9 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
     // 弱引用:Activity/WebView 生命周期比桥短,强引用会在旋转屏幕时把旧的整棵视图树留住
     private final WeakReference<Activity> activityRef;
     private final WeakReference<WebView> webViewRef;
+    /** 对话/录音期间拿住的 CPU 与 WiFi 锁(见 beginLiveAudio)。 */
+    private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
     private final QingyuAudio audio;
     private final QingyuCamera camera;
 
@@ -627,6 +667,72 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
             audio.player().stop();
         } catch (Throwable error) {
             Log.w(TAG, "stopPlayback 失败: " + error);
+        }
+    }
+
+    /**
+     * 对话/录音期间拿住 CPU 与 WiFi:熄屏后系统会把 CPU 睡下去、把 WiFi 省电化,
+     * 页面被节流 + 网络断断续续,表现就是"看着好使、放兜里就不响"。
+     *
+     * 只在**开始说话/开始对话**时拿,结束就还回去 —— 长期占着会明显掉电。
+     * wake lock 另外带 30 分钟上限兜底:万一页面崩了没来得及还,锁也会自己过期。
+     *
+     * @return 拿到的锁的名字(空字符串表示没拿到,靠日志排查)。
+     */
+    @JavascriptInterface
+    public String beginLiveAudio() {
+        StringBuilder got = new StringBuilder();
+        Activity activity = activityRef.get();
+        if (activity == null) {
+            return "";
+        }
+        try {
+            if (wakeLock == null) {
+                PowerManager power = (PowerManager) activity.getSystemService(Context.POWER_SERVICE);
+                if (power != null) {
+                    wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "qingyu:talk");
+                    wakeLock.setReferenceCounted(false);
+                }
+            }
+            if (wakeLock != null && !wakeLock.isHeld()) {
+                wakeLock.acquire(30 * 60 * 1000L);
+                got.append("cpu");
+            }
+            if (wifiLock == null) {
+                WifiManager wifi = (WifiManager) activity.getApplicationContext()
+                        .getSystemService(Context.WIFI_SERVICE);
+                if (wifi != null) {
+                    wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "qingyu:wifi");
+                    wifiLock.setReferenceCounted(false);
+                }
+            }
+            if (wifiLock != null && !wifiLock.isHeld()) {
+                wifiLock.acquire();
+                if (got.length() > 0) {
+                    got.append("+");
+                }
+                got.append("wifi");
+            }
+            Log.i(TAG, "beginLiveAudio → " + got);
+        } catch (Throwable error) {
+            Log.w(TAG, "拿唤醒锁失败: " + error);
+        }
+        return got.toString();
+    }
+
+    /** 说完/关掉对话模式:把锁还回去(幂等)。 */
+    @JavascriptInterface
+    public void endLiveAudio() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+            }
+            if (wifiLock != null && wifiLock.isHeld()) {
+                wifiLock.release();
+            }
+            Log.i(TAG, "endLiveAudio:锁已释放");
+        } catch (Throwable error) {
+            Log.w(TAG, "释放唤醒锁失败: " + error);
         }
     }
 

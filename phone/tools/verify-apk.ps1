@@ -123,7 +123,7 @@ if (-not (Test-Path $manifestSource)) {
     $manifestText = Get-Content -LiteralPath $manifestSource -Raw -Encoding UTF8
     $declared = [regex]::Matches($manifestText, 'uses-permission\s+android:name="([^"]+)"') |
         ForEach-Object { $_.Groups[1].Value }
-    Test-Check 'manifest source declares the required permission set' ($declared.Count -ge 11) ("$($declared.Count) permissions")
+    Test-Check 'manifest source declares the required permission set' ($declared.Count -ge 14) ("$($declared.Count) permissions")
 
     $required = @(
         'android.permission.INTERNET',
@@ -134,7 +134,11 @@ if (-not (Test-Path $manifestSource)) {
         'android.permission.BLUETOOTH',
         'android.permission.BLUETOOTH_CONNECT',
         'android.permission.BLUETOOTH_SCAN',
-        'android.permission.FOREGROUND_SERVICE'
+        'android.permission.FOREGROUND_SERVICE',
+        # 对话模式熄屏也要在跑:CPU 唤醒锁 + 高性能 WiFi 锁
+        'android.permission.WAKE_LOCK',
+        'android.permission.CHANGE_WIFI_STATE',
+        'android.permission.ACCESS_WIFI_STATE'
     )
     foreach ($permission in $required) {
         $inSource = $declared -contains $permission

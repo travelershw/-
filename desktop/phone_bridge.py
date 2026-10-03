@@ -367,6 +367,9 @@ class PhoneSession:
         self.channel = None
         self.rounds = 0
         self.ready_sent = False
+        # 心跳台账（见处理 ping 那段）：次数 + 上一次的时间戳
+        self.pings = 0
+        self.last_ping_at = 0.0
 
     async def send_ready(self, channel: str = "") -> None:
         """告诉手机按什么格式录（同一条连接只发一次，重复 hello 不会再发）。
@@ -634,6 +637,14 @@ async def serve(args) -> int:  # noqa: ANN001 - argparse
                         await session.send_json({"type": "you", "text": text})
                         await session.turn(text, kind="text")
                 elif kind == "ping":
+                    # 心跳是"手机那侧页面还活着吗"的唯一外部证据:熄屏时系统会把 WebView 的
+                    # JS 节流/冻结,页面里所有定时器都会变慢甚至停 —— 那时日志里就是心跳稀疏。
+                    # 记下间隔,排障时一眼能看出"熄屏后多久开始不正常"(2026-10-04 加)。
+                    now = time.monotonic()
+                    gap = now - session.last_ping_at if session.last_ping_at else 0.0
+                    session.last_ping_at = now
+                    session.pings += 1
+                    log(f"心跳 第 {session.pings} 次（间隔 {gap:.1f} 秒）")
                     await session.send_json({"type": "pong", "ts": data.get("ts")})
                 elif kind == "hello":
                     await session.send_ready()

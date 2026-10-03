@@ -15,8 +15,8 @@
 export const APPLICATION_ID = 'dev.qingyu.phone';
 /** 应用名(桌面图标下的名字)。 */
 export const APP_LABEL = '轻语';
-export const VERSION_NAME = '0.2.4';
-export const VERSION_CODE = 6;
+export const VERSION_NAME = '0.2.5';
+export const VERSION_CODE = 7;
 
 /**
  * 分发用的 Tailscale 地址(不带 token,页面里的「家里(Tailscale)」预设用它)。
@@ -92,6 +92,16 @@ export function manifestXml() {
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      对话模式熄屏也要能用:进程活着不等于页面在跑 —— 熄屏后 WebView 的 JS 会被节流
+      (2026-10-04 实测心跳从 25 秒被拉长到 49 秒),所以对话期间还要拿住 CPU 与 WiFi:
+      WAKE_LOCK 给 PowerManager 的 partial wake lock,CHANGE_WIFI_STATE/ACCESS_WIFI_STATE
+      给 WifiManager 的高性能 wifi lock。
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!-- 硬件不是必需的:没有摄像头/蓝牙的手机也应该能装(只是少了对应功能) -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />

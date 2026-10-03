@@ -471,6 +471,8 @@
   var rejoinCount = 0;
   var reconnectTimer = null;
   var pingTimer = null;
+  /** 上一次发心跳的时刻(定时器与音频回调共用,免得重复发)。 */
+  var lastPingAt = 0;
 
   function wsOpen() {
     return !!socket && socket.readyState === WebSocket.OPEN;
@@ -579,9 +581,26 @@
   /** 心跳:每 25 秒发一次 ping,既保活也让死链路早点暴露。 */
   function startPingTimer() {
     stopPingTimer();
+    lastPingAt = Date.now();
     pingTimer = setInterval(function () {
-      if (wsOpen()) { sendJson({ type: 'ping' }); }
+      if (wsOpen()) { sendHeartbeat('定时'); }
     }, 25000);
+  }
+
+  /**
+   * 发一次心跳。
+   *
+   * 为什么还要"跟着音频回调发"(见 convOnLevel):熄屏后系统会把页面定时器压到 1 分钟一次
+   * (2026-10-04 实测 25 秒 → 60 秒),而原生的音频回调是**每 100 ms 一次、照常送达**的。
+   * 对话模式本来就有连续音频,于是顺手在回调里补心跳 —— 这样熄屏保活不依赖定时器。
+   *
+   * @param {string} source 触发来源(写进日志,便于分辨是定时器还是音频回调发的)。
+   */
+  function sendHeartbeat(source) {
+    var now = Date.now();
+    if (now - lastPingAt < 20000) { return; }
+    lastPingAt = now;
+    if (wsOpen()) { sendJson({ type: 'ping' }); }
   }
 
   function stopPingTimer() {
@@ -666,11 +685,14 @@
       el['f-audio'].textContent = audioSegments > 0 ? '已播 ' + audioSegments + ' 段' : '空闲';
       // 没有更多数据了:让原生的缓冲区放完(尾巴不会被切)
       if (nativePlayback) { native('finishPlayback', []); }
+      // 单句模式:她的回答收完了,这一轮结束,把唤醒锁还回去(对话模式还会继续听,不还)
+      if (!convOn) { native('endLiveAudio', []); }
       // 对话模式:等这段(含排队中还没播完的)放完再重新开麦
       if (convOn) { ungateAfterPlayback(); }
     } else if (type === 'error') {
       setStatus('家里报错: ' + frame.message, 'bad');
-      // 对话模式下报错也要开麦,否则这一轮之后就一直哑着
+      // 出错了也要收尾:单句还锁;对话模式重新开麦,否则这一轮之后就一直哑着
+      if (!convOn) { native('endLiveAudio', []); }
       if (convOn) { gateConv(false); }
     }
   }
@@ -794,6 +816,8 @@
     recordedBytes = 0;
     recordStartedAt = Date.now();
     recording = true;
+    // 单句也说一句就走:这几十秒同样要拿住 CPU/WiFi(页面被节流的话,松手那一刻发不出去)
+    native('beginLiveAudio', []);
     el.oneShot.className = 'big live';
     el.oneShot.textContent = '结束并发送';
     el.recordText.textContent = '录音中…';
@@ -814,6 +838,7 @@
     try { during = fetchRoute(); } catch (error) { logLine('读路由出错(不影响发送): ' + error); }
     recording = false;
     native('stopRecording', []);
+    // 发送窗口很短,锁先留着;真正还锁放在 sendUtterance 之后
     if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
     el.oneShot.className = 'big ghost';
     el.oneShot.textContent = '说一句';
@@ -868,6 +893,7 @@
     socket.send(JSON.stringify(frame.json));
     socket.send(frame.binary);
     logLine('→ utterance + wav ' + frame.binary.byteLength + ' 字节(含 44 字节头)');
+    // 锁先留着:还要把她的回答收完放出来(audio_end 时才还;对话模式则一直留到关掉模式)
   }
 
   // ---------------------------------------------------------------- 对话模式
@@ -890,6 +916,8 @@
   /** 最近几块留作下一句的开头(不然会切掉第一个字)。 */
   var convPreRoll = [];
   var convGateTimer = null;
+  /** 该在什么时刻重新开麦(音频回调据此判断,不依赖定时器)。 */
+  var convGateUntil = 0;
   var convUiTimer = null;
   var convSince = 0;
   /** 本底噪声(环境安静时的读数):阈值跟着它走,免得在吵的地方一直触发。 */
@@ -945,7 +973,10 @@
     convSince = Date.now();
     el.ptt.className = 'big live';
     updateConvUi();
-    logLine('对话模式已开启(连续听,静音 ' + CONV_SILENCE_MS + ' ms 切句)');
+    // 拿住 CPU 与 WiFi:熄屏后系统会节流页面、把网络省电化,拿住才真的"一直在听"
+    var locks = native('beginLiveAudio', []);
+    logLine('对话模式已开启(连续听,静音 ' + CONV_SILENCE_MS + ' ms 切句)'
+      + (locks ? ' · 唤醒锁:' + locks : ' · 唤醒锁:没拿到'));
     setHint('对话模式:说就行,停顿一下我自动发出去;她说话时自动闭麦。再点一次结束。');
     convUiTimer = setInterval(updateConvUi, 1000);
     refreshRoute();
@@ -962,6 +993,7 @@
     convSpeech = false;
     convPreRoll = [];
     native('stopRecording', []);
+    native('endLiveAudio', []);
     el.ptt.className = 'big';
     el.ptt.textContent = '开始对话';
     el.recordText.textContent = '已停';
@@ -1004,6 +1036,7 @@
   function gateConv(gated) {
     convGate = gated;
     if (convGateTimer) { clearTimeout(convGateTimer); convGateTimer = null; }
+    if (!gated) { convGateUntil = 0; }
     if (gated) {
       // 她一直不回(报错、超时)也要解封,不然麦克风就永远哑着
       convGateTimer = setTimeout(function () {
@@ -1027,12 +1060,15 @@
       queuedMs = Math.max(0, (nextPlayTime - audioContext.currentTime) * 1000);
     }
     if (convGateTimer) { clearTimeout(convGateTimer); convGateTimer = null; }
+    // 两套触发,谁先到算谁:①音频回调里的时间判断(熄屏也准) ②定时器(兜底)
+    convGateUntil = Date.now() + queuedMs + 400;
     convGateTimer = setTimeout(function () {
       convGateTimer = null;
-      if (!convOn) { return; }
+      if (!convOn || !convGate) { return; }
+      convGateUntil = 0;
       gateConv(false);
       convPreRoll = [];
-      logLine('对话模式:她说完' + (queuedMs > 200 ? '(含排队 ' + Math.round(queuedMs) + ' ms)' : '') + ',继续听');
+      logLine('对话模式:她说完(含排队 ' + Math.round(queuedMs) + ' ms),继续听');
     }, queuedMs + 400);
   }
 
@@ -1041,7 +1077,19 @@
    * @param {number} dbfs 这一块(100 ms)的 dBFS。
    */
   function convOnLevel(dbfs) {
-    if (!convOn || convGate) { return; }
+    if (!convOn) { return; }
+    // 熄屏后定时器会被压到 1 分钟一次,但音频回调照常每 100 ms 来一次 ——
+    // 心跳和"重新开麦"都挂在这条线上,才不会被系统的定时器节流拖死。
+    sendHeartbeat('音频');
+    if (convGate) {
+      if (convGateUntil && Date.now() >= convGateUntil) {
+        convGateUntil = 0;
+        gateConv(false);
+        convPreRoll = [];
+        logLine('对话模式:她说完(音频驱动),继续听');
+      }
+      return;
+    }
     var now = Date.now();
     var threshold = convThreshold();
     if (dbfs > threshold) {
