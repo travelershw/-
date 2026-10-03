@@ -15,8 +15,8 @@
 export const APPLICATION_ID = 'dev.qingyu.phone';
 /** 应用名(桌面图标下的名字)。 */
 export const APP_LABEL = '轻语';
-export const VERSION_NAME = '0.2.9';
-export const VERSION_CODE = 11;
+export const VERSION_NAME = '0.2.11';
+export const VERSION_CODE = 13;
 
 /**
  * 分发用的 Tailscale 地址(不带 token,页面里的「家里(Tailscale)」预设用它)。
@@ -162,10 +162,15 @@ export function manifestXml() {
  * @returns {string} res/xml/file_paths.xml 源码。
  */
 export function filePathsXml() {
+  // **两个 name 必须不同**:FileProvider 内部是 mRoots.put(name, root),同名的后者会
+  // **覆盖**前者 —— 一开始两条都叫 images,于是只剩"外部缓存"那一根,而照片写在内部缓存
+  // cache/images/,getUriForFile 就抛 IllegalArgumentException:
+  // "Failed to find configured root that contains /data/data/<包名>/cache/images/…"
+  // 表现是点「拍照」立刻报错、相机根本拉不起来(2026-10-03 用户报的"拍照无法使用")。
   return `<?xml version="1.0" encoding="utf-8"?>
 <paths>
     <cache-path name="images" path="images/" />
-    <external-cache-path name="images" path="images/" />
+    <external-cache-path name="external_images" path="images/" />
 </paths>
 `;
 }

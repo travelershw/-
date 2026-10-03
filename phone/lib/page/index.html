@@ -650,6 +650,7 @@
       setStatus('已握手 ready', 'ok');
       audioRate = frame.sample_rate || audioRate;
       refreshRoute();
+      flushPhotoOutbox();
     } else if (type === 'you') {
       // 她听到的:用来核对"收音到底对不对"
       var meta = [];
@@ -906,6 +907,32 @@
     socket.send(frame.binary);
     logLine('→ utterance + wav ' + frame.binary.byteLength + ' 字节(含 44 字节头)');
     // 锁先留着:还要把她的回答收完放出来(audio_end 时才还;对话模式则一直留到关掉模式)
+  }
+
+  /** 没连上时拍到的照片先放这里,连上立刻补发(相机在前台时 socket 常常正好断着)。 */
+  var photoOutbox = [];
+  var PHOTO_OUTBOX_MAX = 3;
+
+  /** 收一张待发照片(最多存 3 张,超了丢最旧的)。 */
+  function queuePhoto(bytes, text, kb) {
+    photoOutbox.push({ bytes: bytes, text: text });
+    while (photoOutbox.length > PHOTO_OUTBOX_MAX) { photoOutbox.shift(); }
+    logLine('未连接,照片先存着(' + kb + ' KB,待发 ' + photoOutbox.length + ' 张),连上就补发');
+    setHint('现在没连上家里,照片先存着:' + kb + ' KB。连上会自动补发给她。');
+  }
+
+  /** 连上之后把存着的照片补发出去。 */
+  function flushPhotoOutbox() {
+    if (!photoOutbox.length || !pure || !wsOpen()) { return; }
+    var count = photoOutbox.length;
+    photoOutbox.forEach(function (item) {
+      var frame = pure.buildImageFrame(item.bytes, item.text);
+      socket.send(JSON.stringify(frame.json));
+      socket.send(frame.binary);
+      logLine('→ 补发 image + jpeg ' + (frame.binary.byteLength / 1024).toFixed(1) + ' KB');
+    });
+    photoOutbox = [];
+    setHint('连上了,刚才那张照片已补发给她(' + count + ' 张)');
   }
 
   // ---------------------------------------------------------------- 对话模式
@@ -1400,8 +1427,10 @@
       var frame = pure.buildImageFrame(bytes, text || '看看这个');
       var kb = (frame.binary.byteLength / 1024).toFixed(1);
       if (!wsOpen()) {
-        logLine('未连接,照片丢弃(' + kb + ' KB)');
-        setHint('没连上家里,照片没发出去(' + kb + ' KB)');
+        // **别丢**:相机在前台时这个 App 会被切到后台,socket 往往正好断在这一刻
+        // (2026-10-04 实测:照片 61.1 KB 拍回来了,却因为"未连接"被直接丢掉,
+        //  用户看到的就是"拍完回来没反应")。先收进待发队列,连上立刻补发。
+        queuePhoto(bytes, text || '看看这个', kb);
         return;
       }
       socket.send(JSON.stringify(frame.json));

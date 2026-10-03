@@ -167,6 +167,17 @@ Test-Check 'FileProvider declared' ($tree -match 'androidx\.core\.content\.FileP
 Test-Check 'FileProvider authority dev.qingyu.phone.fileprovider' ($tree -match 'dev\.qingyu\.phone\.fileprovider')
 Test-Check 'FileProvider paths metadata' ($tree -match 'android\.support\.FILE_PROVIDER_PATHS')
 Test-Check 'FileProvider not exported' ($tree -match 'exported\(0x01010010\)=false')
+
+# 6. 两条 paths 的 name 必须不同。
+#    FileProvider 内部是 mRoots.put(name, root) —— **同名的后者会覆盖前者**,
+#    于是其中一条等于不存在。曾经两条都叫 images,结果只剩外部缓存那一根,
+#    而照片写在内部缓存,getUriForFile 直接抛 "Failed to find configured root that
+#    contains /data/data/<包名>/cache/images/…" —— 点拍照立刻报错、相机拉不起来。
+#    这个坑只在真机上才暴露,静态校验必须盯着。
+$pathsTree = (Invoke-Tool 'aapt2.exe' @('dump', 'xmltree', '--file', 'res/xml/file_paths.xml', $Apk)).Output
+$rootNames = [regex]::Matches($pathsTree, 'name="([^"]+)"\s*\(Raw') | ForEach-Object { $_.Groups[1].Value }
+$uniqueRootNames = $rootNames | Select-Object -Unique
+Test-Check 'FileProvider roots have distinct names' ($rootNames.Count -eq $uniqueRootNames.Count) ("$($rootNames -join ', ')")
 Test-Check 'camera feature declared (optional installs allowed)' ($tree -match 'android\.hardware\.camera"')
 
 # 6. Stage 2 specifics.
