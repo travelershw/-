@@ -15,8 +15,8 @@
 export const APPLICATION_ID = 'dev.qingyu.phone';
 /** 应用名(桌面图标下的名字)。 */
 export const APP_LABEL = '轻语';
-export const VERSION_NAME = '0.2.1';
-export const VERSION_CODE = 3;
+export const VERSION_NAME = '0.2.2';
+export const VERSION_CODE = 4;
 
 /**
  * 分发用的 Tailscale 地址(不带 token,页面里的「家里(Tailscale)」预设用它)。
@@ -65,7 +65,7 @@ export function manifestXml() {
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- 阶段 2:按住说话录音 -->
+    <!-- 阶段 2:点击说话录音 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 

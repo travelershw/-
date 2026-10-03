@@ -552,7 +552,7 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
     }
 
     /**
-     * 独立的 SCO 试验:不录音、不用按住说话,直接把蓝牙通话链路按时间线跑一遍,
+     * 独立的 SCO 试验:不录音、不用点击说话,直接把蓝牙通话链路按时间线跑一遍,
      * 每一步的结果都记下来。现场判断"系统到底给不给这条链路"就靠它。
      * @return JSON:{ok, conclusion, steps:[...], text:"多行时间线"};text 同时进 diagnostics。
      */
@@ -1407,7 +1407,7 @@ public class QingyuAudio {
             sb.append("输出设备 ").append(join(" / ", deviceList(AudioManager.GET_DEVICES_OUTPUTS))).append('\\n');
             sb.append("档位尝试:").append('\\n');
             if (attemptLog.isEmpty()) {
-                sb.append("  (本次启动还没录过音;按住说话会依次试)").append('\\n');
+                sb.append("  (本次启动还没录过音;点「点击说话」会依次试)").append('\\n');
             } else {
                 for (String line : attemptLog) {
                     sb.append("  ").append(line).append('\\n');
@@ -1544,9 +1544,9 @@ public class QingyuAudio {
             return "系统报不出可用的蓝牙通话设备:去 设置 → 蓝牙 → 已配对设备 → 耳机 → 打开『通话音频』(HFP),再回来刷新";
         }
         if (modern) {
-            return "耳机可用。未录音时输入设备列表里本来就不会有它(SCO 只在录音时才建),按住说话时会切过去";
+            return "耳机可用。未录音时输入设备列表里本来就不会有它(SCO 只在录音时才建),点击说话时会切过去";
         }
-        return "按住说话会自动切到耳机;若仍用手机麦,请检查耳机『通话音频』是否打开";
+        return "点击说话会自动切到耳机;若仍用手机麦,请检查耳机『通话音频』是否打开";
     }
 
     /** @return 手机是否有蓝牙硬件(耳机连没连是另一回事)。 */

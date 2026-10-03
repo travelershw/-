@@ -14,7 +14,7 @@
 | --- | --- |
 | `lib/android-project.js` | Gradle 工程 / manifest / 版本号 / 权限的**单一来源**（包名、versionCode、FileProvider、前台服务、蓝牙权限分档） |
 | `lib/android-sources.js` | 生成的 Java 源码：`MainActivity` + `QingyuNative` 桥、`QingyuAudio`（三档 SCO 路由）、`QingyuCamera`、`QingyuService`（前台服务 + 保活） |
-| `lib/page/index.html`、`lib/page/pure.js` | App 里的本地页面：连接、按住说话、拍照、SCO 试验、复制诊断 |
+| `lib/page/index.html`、`lib/page/pure.js` | App 里的本地页面：连接、点击说话（**开关式**：点一下开始、再点一下结束并发送）、拍照、SCO 试验、复制诊断 |
 | `lib/dist-docs.js` | 分发包里的纯文本说明（含「异地测试包」那份） |
 | `lib/zip.js` | 零依赖 ZIP 写入器（两个打包工具共用） |
 | `lib/toolchain.js` | 工具链路径的单一来源 —— **仓库里不写死本机路径**，见下面「构建」 |

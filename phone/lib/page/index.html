@@ -7,7 +7,7 @@
 <!--
   轻语手机端的本地页面(打包进 APK 的 assets,不是远程页面)。
 
-  阶段 2:按住说话真的录音(原生 AudioRecord + 蓝牙耳机麦)、拍照真的上传、
+  阶段 2:说话按钮真的录音(原生 AudioRecord + 蓝牙耳机麦)、拍照真的上传、
   她的语音按到达顺序排队播放。纯计算部分(WAV 封装、组帧、base64)在 pure.js 里,
   那一份能用 node tools/page-protocol-test.js 在没有手机的情况下验证。
 
@@ -175,14 +175,14 @@
 <body>
 
 <h1>轻语</h1>
-<div class="sub">手机端 v<span id="appVersion">…</span> · 按住说话 · 拍照给她看 · 她用自己的声音回答</div>
+<div class="sub">手机端 v<span id="appVersion">…</span> · 点击说话 · 拍照给她看 · 她用自己的声音回答</div>
 
 <section id="guideCard" class="card" style="display:none">
   <h2>三步用起来(第一次使用)</h2>
   <div class="steps">
     <div><b>①</b> 手机装 <b>Tailscale</b> 并登录<b>和家里电脑同一个账号</b>(在外面也能连)。手机和电脑在<b>同一个 WiFi</b> 时这步可以跳过。</div>
     <div><b>②</b> 填服务器地址:点下面的「家里(Tailscale)」;同一个 WiFi 就点「同一个 WiFi」,再把 IP 改成电脑的局域网地址。令牌通常留空。</div>
-    <div><b>③</b> 点「连接」。状态显示"已握手 ready"就通了 —— 按住「按住说话」说一句,松开就会发出去。</div>
+    <div><b>③</b> 点「连接」。状态显示"已握手 ready"就通了 —— 点一下「点击说话」开始,再点一下结束并发送。</div>
   </div>
   <div class="row">
     <button id="guideClose" class="ghost">知道了,不再显示</button>
@@ -243,17 +243,17 @@
 <section class="card">
   <h2>说话与拍照</h2>
   <div class="row">
-    <button id="ptt" class="big">按住说话</button>
+    <button id="ptt" class="big">点击说话</button>
     <button id="camera" class="big ghost">拍照</button>
   </div>
   <div class="meter"><div id="levelBar"></div></div>
   <div class="meterline"><span id="levelText">-100.0 dBFS</span><span id="recordText">未录音</span></div>
-  <div id="placeholder" class="hint">按住说话:松开即发送(16 kHz 单声道 WAV)&nbsp;·&nbsp;拍照:拍完自动缩放上传</div>
+  <div id="placeholder" class="hint">点击说话:点一下开始,再点一下结束并发送(16 kHz 单声道 WAV,最长 30 秒)&nbsp;·&nbsp;拍照:拍完自动缩放上传</div>
 </section>
 
 <section class="card">
   <h2>她听到的 / 她说的</h2>
-  <div id="heard" class="hint">还没有收到 you 帧。按住说话说一句,这里会显示识别结果、电平和耗时。</div>
+  <div id="heard" class="hint">还没有收到 you 帧。点「点击说话」说一句,这里会显示识别结果、电平和耗时。</div>
   <div id="dialogue"></div>
   <div class="facts" style="margin-top:10px">
     <div><span>本轮上行时长</span><span id="s-up">—</span></div>
@@ -722,18 +722,24 @@
   var routeTimer = null;
   var sendTimer = null;
 
-  /** 按住说话:开原生录音(16 kHz 单声道,强制走蓝牙耳机麦)。 */
+  /**
+   * 开始说话:开原生录音(16 kHz 单声道,强制走蓝牙耳机麦)。
+   *
+   * 2026-10-03 起按钮改成**开关式**(点一下开始、再点一下结束并发送):按住说话的
+   * 那套手势在耳机/走路场景里不好用,而且"松手"这个动作容易被系统手势抢走。
+   * 安全网:原生那边 30 秒上限会强制停并自动发送(`onRecordingStopped('timeout')`)。
+   */
   function startTalking() {
     if (recording) { return; }
     if (!bridgeReady) {
-      setHint('按住说话:在浏览器里打开没有原生桥,录不了音');
+      setHint('点击说话:在浏览器里打开没有原生桥,录不了音');
       logLine('没有原生桥,startRecording 不可用');
       return;
     }
     if (!wsOpen()) {
       // 允许录,但要说清楚发不出去(家里那侧没连上时最常见的困惑)
       setHint('还没连上家里,这段录音会发不出去');
-      logLine('未连接就开始录音,提醒:松开后无法发送');
+      logLine('未连接就开始录音,提醒:结束时发不出去');
     }
     // 按下这一瞬间的路由:和"录音中"的路由一对比就知道麦有没有被切过去
     logRoute('按下前');
@@ -754,7 +760,7 @@
     recordStartedAt = Date.now();
     recording = true;
     el.ptt.className = 'big live';
-    el.ptt.textContent = '松开结束';
+    el.ptt.textContent = '结束并发送';
     el.recordText.textContent = '录音中…';
     logLine('开始录音(16 kHz 单声道 PCM16)');
     refreshRoute();
@@ -765,7 +771,7 @@
     }, 1000);
   }
 
-  /** 松开:停录音,等最后一小块 PCM 到齐,再封 WAV 发出去。 */
+  /** 结束这一段:停录音,等最后一小块 PCM 到齐,再封 WAV 发出去。 */
   function stopTalking(autoReason) {
     if (!recording) { return; }
     // 先取"录音中"的真实路由:一停录音,AudioRecord 就没了,routedDevice 也就读不到了
@@ -775,7 +781,7 @@
     native('stopRecording', []);
     if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
     el.ptt.className = 'big';
-    el.ptt.textContent = '按住说话';
+    el.ptt.textContent = '点击说话';
     el.recordText.textContent = '已停(' + (recordedBytes / 1024).toFixed(1) + ' KB)';
     if (autoReason) { logLine('录音被自动停止: ' + autoReason); }
     // **先把发送排上,再去显示路由**:2026-10-03 踩过 —— 显示路由的代码抛了异常,
@@ -803,6 +809,8 @@
     if (!recording) { return; }
     var secs = ((Date.now() - recordStartedAt) / 1000).toFixed(1);
     el.recordText.textContent = '录音中 ' + secs + ' 秒 / ' + (recordedBytes / 1024).toFixed(1) + ' KB';
+    // 开关式:按钮上直接显示秒数,一眼看得出"正在录",不用去找下面那行小字
+    el.ptt.textContent = '结束并发送 (' + secs + ' 秒)';
   }
 
   /** 把这一轮攒下的 PCM 封成 WAV,按协议发出去。 */
@@ -1045,7 +1053,7 @@
       var short = String(name).replace('android.permission.', '');
       logLine('权限 ' + short + ' → ' + (granted ? '已允许' : '被拒'));
       if (short === 'RECORD_AUDIO') {
-        setHint(granted ? '麦克风权限已允许,现在可以按住说话' : '麦克风权限被拒,按住说话录不了音');
+        setHint(granted ? '麦克风权限已允许,现在可以点「点击说话」' : '麦克风权限被拒,点击说话录不了音');
       }
       if (short === 'BLUETOOTH_CONNECT') {
         setHint(granted
@@ -1072,15 +1080,17 @@
   }
 
   // ---------------------------------------------------------------- 其它按钮
-  el.ptt.addEventListener('pointerdown', function (event) {
-    event.preventDefault();
-    startTalking();
+  // 说话按钮是**开关式**(2026-10-03 由"按住说话"改来):
+  //   点一下开始录,再点一下结束并发送 —— 走路/戴耳机时按住不放很别扭,
+  //   而且"松手"这个动作常被系统手势或来电抢走,导致一段话白说。
+  //   忘记关也没关系:原生 30 秒上限会强制停并自动发送(按钮上一直显示秒数)。
+  el.ptt.addEventListener('click', function () {
+    if (recording) {
+      stopTalking();
+    } else {
+      startTalking();
+    }
   });
-  ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (name) {
-    el.ptt.addEventListener(name, function () { stopTalking(); });
-  });
-  // 手指按在按钮外再松开也要收尾,否则会一直录到 30 秒上限
-  window.addEventListener('pointerup', function () { stopTalking(); });
 
   el.camera.addEventListener('click', takePhoto);
   el.refreshRoute.addEventListener('click', function () {
@@ -1099,7 +1109,7 @@
     var effective = native('setScoMode', [el.scoMode.value]);
     logLine('SCO 方式改为 ' + el.scoMode.value + '(实际生效 ' + effective + ')');
     try { localStorage.setItem('qingyu.scoMode', String(effective || el.scoMode.value)); } catch (error) { /* 无所谓 */ }
-    setHint('SCO 方式已切到「' + (pure ? pure.scoModeText(effective) : effective) + '」,按住说话试一次,看卡片上「本次录音输入设备」');
+    setHint('SCO 方式已切到「' + (pure ? pure.scoModeText(effective) : effective) + '」,点一次「点击说话」,看卡片上「本次录音输入设备」');
     refreshRoute();
   });
 
@@ -1124,7 +1134,7 @@
     });
   });
 
-  // SCO 试验:不录音、不用按住说话,直接看蓝牙通话链路能不能建起来
+  // SCO 试验:不录音、不用点击说话,直接看蓝牙通话链路能不能建起来
   el.probeSco.addEventListener('click', function () {
     if (!bridgeReady) {
       setHint('没有原生桥,做不了 SCO 试验');
