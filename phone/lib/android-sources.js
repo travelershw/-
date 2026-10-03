@@ -571,6 +571,66 @@ public class QingyuNative implements QingyuAudio.Listener, QingyuCamera.Listener
     }
 
     /**
+     * 开始放她的声音(原生 AudioTrack,优先走耳机通话链路)。
+     * @param sampleRate 家里下发的采样率(24000)。
+     * @return 是否开起来了(false 时页面退回 Web Audio 外放)。
+     */
+    @JavascriptInterface
+    public boolean startPlayback(int sampleRate) {
+        try {
+            boolean ok = audio.player().start(sampleRate);
+            Log.i(TAG, "startPlayback(" + sampleRate + ") → " + ok);
+            return ok;
+        } catch (Throwable error) {
+            Log.w(TAG, "startPlayback 失败: " + error);
+            return false;
+        }
+    }
+
+    /**
+     * 写一段她的 PCM(base64)。
+     * @param base64Pcm PCM16 小端单声道。
+     */
+    @JavascriptInterface
+    public void writePlayback(String base64Pcm) {
+        try {
+            audio.player().write(base64Pcm);
+        } catch (Throwable error) {
+            Log.w(TAG, "writePlayback 失败: " + error);
+        }
+    }
+
+    /** 这一轮数据发完了:让缓冲区里的放完再释放(尾巴不会被切)。 */
+    @JavascriptInterface
+    public void finishPlayback() {
+        try {
+            audio.player().finish();
+        } catch (Throwable error) {
+            Log.w(TAG, "finishPlayback 失败: " + error);
+        }
+    }
+
+    /** 还剩多少毫秒放完 —— 页面用它决定什么时候重新开麦。 */
+    @JavascriptInterface
+    public int playbackRemainingMs() {
+        try {
+            return audio.player().remainingMs();
+        } catch (Throwable error) {
+            return 0;
+        }
+    }
+
+    /** 立刻停掉她的声音(幂等)。 */
+    @JavascriptInterface
+    public void stopPlayback() {
+        try {
+            audio.player().stop();
+        } catch (Throwable error) {
+            Log.w(TAG, "stopPlayback 失败: " + error);
+        }
+    }
+
+    /**
      * 独立的 SCO 试验:不录音、不用点击说话,直接把蓝牙通话链路按时间线跑一遍,
      * 每一步的结果都记下来。现场判断"系统到底给不给这条链路"就靠它。
      * @return JSON:{ok, conclusion, steps:[...], text:"多行时间线"};text 同时进 diagnostics。
@@ -963,6 +1023,8 @@ public class QingyuAudio {
     private volatile String lastAttempt = "";
     /** 最近一次 SCO 试验的完整时间线,进 diagnostics。 */
     private volatile String lastProbeText = "";
+    /** 放她的声音(原生 AudioTrack,优先走耳机通话链路)。 */
+    private final QingyuPlayer player;
 
     /** HFP 代理:getProfileProxy 是异步的,必须保存监听器并等 onServiceConnected。 */
     private volatile BluetoothHeadset headsetProxy;
@@ -976,6 +1038,8 @@ public class QingyuAudio {
         this.context = context.getApplicationContext();
         this.audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
         this.listener = listener;
+        // 播放归音频这边一起管:routeJson() 才能把"她的声音从哪个设备出来"一起报上去
+        this.player = new QingyuPlayer(this.context, this.audioManager);
         try {
             // 路由方式是现场试出来的结论,必须跨重启记住
             this.scoMode = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_SCO_MODE, "auto");
@@ -983,6 +1047,11 @@ public class QingyuAudio {
         } catch (Throwable error) {
             Log.w(TAG, "读 SCO 方式失败: " + error);
         }
+    }
+
+    /** @return 播放器(页面通过桥调用它放她的声音)。 */
+    public QingyuPlayer player() {
+        return player;
     }
 
     /** @return 是否正在录音。 */
@@ -1210,6 +1279,9 @@ public class QingyuAudio {
             // 一眼看清现在用的是哪个麦克风:耳机麦 / 有线耳麦 / 手机麦
             json.put("currentMic", currentMicLabel());
             json.put("currentMicKind", currentMicKind());
+            // 她的声音现在从哪个设备出来、用的哪种用法(不用猜,看这两条)
+            json.put("playerRoute", player.routedName());
+            json.put("playerUsage", player.usageName());
             // 一整段可直接粘贴的纯文本:页面的「复制诊断」按钮就用它
             json.put("diagnostics", diagnostics());
             json.put("hint", hint());
@@ -2639,6 +2711,250 @@ public class QingyuAudio {
         }
         String name = device.getProductName() == null ? "" : device.getProductName().toString();
         return name.toLowerCase(Locale.US).contains("bluetooth");
+    }
+}
+`;
+}
+
+/**
+ * 放她的声音:**原生 AudioTrack**,而不是 WebView 里的 Web Audio。
+ *
+ * 为什么要挪到原生(2026-10-03 用户报"声音从手机扬声器出来了"):
+ * 页面的 Web Audio 输出走的是**媒体**流,而对话模式为了拿耳机麦克风一直挂着 SCO 通话链路 ——
+ * SCO 一挂,A2DP(媒体)就被系统挂起,媒体流就没有去耳机的路了,只能从手机扬声器出来。
+ * 原生这边用 `USAGE_VOICE_COMMUNICATION` 建 AudioTrack 并把首选设备指到 SCO,
+ * 声音就和麦克风走同一条耳机链路(代价是音质变成"通话音质",耳机在 HFP 模式下本来就窄带)。
+ *
+ * 没接耳机时不这么干:`USAGE_VOICE_COMMUNICATION` 在没有耳机时会把声音送到**听筒**,
+ * 那比扬声器还小声 —— 所以按"当前有没有 SCO/耳机设备"决定用通话用法还是媒体用法。
+ *
+ * @returns {string} QingyuPlayer.java 源码。
+ */
+export function qingyuPlayerJava() {
+  return `package ${APPLICATION_ID};
+
+import android.content.Context;
+import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
+import android.util.Base64;
+import android.util.Log;
+
+/**
+ * 播放她的 PCM:24 kHz / 单声道 / PCM16,优先走耳机(通话链路)。
+ */
+public class QingyuPlayer {
+
+    private static final String TAG = "Qingyu";
+    private static final int DEFAULT_RATE = 24000;
+    /** 缓冲区:太小会断续,太大她的第一声会晚。约 300 ms。 */
+    private static final int BUFFER_MS = 300;
+
+    private final Context context;
+    private final AudioManager audioManager;
+    private volatile AudioTrack track;
+    private volatile int sampleRate = DEFAULT_RATE;
+    /** 已写入的帧数与"用户听到的"帧数,用来算还剩多久放完。 */
+    private volatile long writtenFrames;
+    private volatile long drainedFrames;
+    /** 这一轮用的是通话用法(耳机)还是媒体用法(外放)。 */
+    private volatile String usage = "media";
+
+    public QingyuPlayer(Context context, AudioManager audioManager) {
+        this.context = context;
+        this.audioManager = audioManager;
+    }
+
+    /** 当前用的是哪种用法(进诊断,便于确认声音到底走哪条路)。 */
+    public String usageName() {
+        return usage;
+    }
+
+    /**
+     * 开始一轮播放。
+     * @param rate 采样率(家里下发的是 24000)。
+     * @return 是否开起来了。
+     */
+    public synchronized boolean start(int rate) {
+        stop();
+        sampleRate = rate > 0 ? rate : DEFAULT_RATE;
+        // 有 SCO/耳机就用通话用法(声音进耳机);没有就用媒体用法(走扬声器,别掉进听筒)
+        AudioDeviceInfo sco = findScoOutput();
+        usage = sco != null ? "voice_communication" : "media";
+        AudioAttributes attributes = new AudioAttributes.Builder()
+                .setUsage("voice_communication".equals(usage)
+                        ? AudioAttributes.USAGE_VOICE_COMMUNICATION
+                        : AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+        AudioFormat format = new AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build();
+        int minBytes = AudioTrack.getMinBufferSize(sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        int bytes = Math.max(minBytes, sampleRate * 2 * BUFFER_MS / 1000);
+        try {
+            AudioTrack built = new AudioTrack.Builder()
+                    .setAudioAttributes(attributes)
+                    .setAudioFormat(format)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .setBufferSizeInBytes(bytes)
+                    .build();
+            if (built.getState() != AudioTrack.STATE_INITIALIZED) {
+                built.release();
+                Log.w(TAG, "AudioTrack 初始化失败");
+                return false;
+            }
+            if (sco != null) {
+                built.setPreferredDevice(sco);
+            }
+            built.play();
+            track = built;
+            writtenFrames = 0;
+            drainedFrames = 0;
+            Log.i(TAG, "播放开始 " + sampleRate + " Hz,用法=" + usage
+                    + ",首选=" + (sco == null ? "无" : describe(sco)));
+            return true;
+        } catch (Throwable error) {
+            Log.w(TAG, "建 AudioTrack 失败: " + error);
+            return false;
+        }
+    }
+
+    /**
+     * 写一段 PCM(页面把二进制帧转成 base64 送过来)。
+     * @param base64Pcm PCM16 小端单声道。
+     */
+    public synchronized void write(String base64Pcm) {
+        AudioTrack active = track;
+        if (active == null || base64Pcm == null || base64Pcm.isEmpty()) {
+            return;
+        }
+        try {
+            byte[] pcm = Base64.decode(base64Pcm, Base64.DEFAULT);
+            int written = active.write(pcm, 0, pcm.length);
+            if (written > 0) {
+                writtenFrames += written / 2;
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "写 PCM 失败: " + error);
+        }
+    }
+
+    /**
+     * 没有更多数据了:等在缓冲区里的放完再释放,不然尾巴会被切掉。
+     */
+    public synchronized void finish() {
+        final AudioTrack active = track;
+        if (active == null) {
+            return;
+        }
+        new Thread(() -> {
+            long limit = System.currentTimeMillis() + 15000;
+            while (System.currentTimeMillis() < limit) {
+                if (playbackHead(active) >= writtenFrames) {
+                    break;
+                }
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            synchronized (QingyuPlayer.this) {
+                if (track == active) {
+                    stop();
+                }
+            }
+        }, "qingyu-player-drain").start();
+    }
+
+    /** 还剩多少毫秒放完(页面用它决定什么时候重新开麦)。 */
+    public int remainingMs() {
+        AudioTrack active = track;
+        if (active == null) {
+            return 0;
+        }
+        long left = writtenFrames - playbackHead(active);
+        if (left <= 0) {
+            return 0;
+        }
+        return (int) Math.min(60000L, left * 1000L / Math.max(1, sampleRate));
+    }
+
+    /** 她的声音现在实际从哪个设备出来(诊断里直接看这条)。 */
+    public String routedName() {
+        AudioTrack active = track;
+        if (active == null) {
+            return "(未在播放," + usage + ")";
+        }
+        try {
+            AudioDeviceInfo routed = active.getRoutedDevice();
+            return routed == null ? "(读不到," + usage + ")" : describe(routed) + "(" + usage + ")";
+        } catch (Throwable error) {
+            return "(读设备失败," + usage + ")";
+        }
+    }
+
+    /** 停掉并释放(幂等)。 */
+    public synchronized void stop() {
+        AudioTrack active = track;
+        track = null;
+        if (active == null) {
+            return;
+        }
+        try {
+            drainedFrames = writtenFrames;
+            active.stop();
+        } catch (Throwable error) {
+            Log.w(TAG, "AudioTrack.stop 异常: " + error);
+        }
+        try {
+            active.release();
+        } catch (Throwable error) {
+            Log.w(TAG, "AudioTrack.release 异常: " + error);
+        }
+    }
+
+    /** 播放头(帧)。有些设备在 stop 之后会抛,统一兜住。 */
+    private long playbackHead(AudioTrack active) {
+        try {
+            long head = active.getPlaybackHeadPosition();
+            return head < 0 ? 0 : head;
+        } catch (Throwable error) {
+            return writtenFrames;
+        }
+    }
+
+    /** 找一个 SCO 输出设备(耳机在通话模式下就是它)。 */
+    private AudioDeviceInfo findScoOutput() {
+        if (audioManager == null) {
+            return null;
+        }
+        try {
+            for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int type = device.getType();
+                if (type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || type == AudioDeviceInfo.TYPE_WIRED_HEADSET
+                        || type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                    return device;
+                }
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "列输出设备失败: " + error);
+        }
+        return null;
+    }
+
+    /** 设备 → "名字 [TYPE_x(编号,中文)]"。 */
+    private String describe(AudioDeviceInfo device) {
+        String name = device.getProductName() == null ? "" : device.getProductName().toString();
+        return name + " [TYPE_" + device.getType() + "]";
     }
 }
 `;

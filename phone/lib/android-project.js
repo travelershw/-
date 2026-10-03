@@ -15,8 +15,8 @@
 export const APPLICATION_ID = 'dev.qingyu.phone';
 /** 应用名(桌面图标下的名字)。 */
 export const APP_LABEL = '轻语';
-export const VERSION_NAME = '0.2.3';
-export const VERSION_CODE = 5;
+export const VERSION_NAME = '0.2.4';
+export const VERSION_CODE = 6;
 
 /**
  * 分发用的 Tailscale 地址(不带 token,页面里的「家里(Tailscale)」预设用它)。

@@ -462,6 +462,8 @@
   var audioSegments = 0;
   var inAudioSegment = false;
   var audioRate = 24000;
+  /** 这一轮她的声音是不是交给原生播的(原生才能走耳机通话链路)。 */
+  var nativePlayback = false;
   var lastLevel = -100;
   /** 用户是否希望保持连接(主动断开才置 false)—— 决定断线后要不要自动重连。 */
   var wantConnected = false;
@@ -645,6 +647,12 @@
       inAudioSegment = true;
       // 边说边播:从现在开始,每收到一段就往后排一段
       nextPlayTime = 0;
+      // 她的声音交给原生播(转成通话用法 → 走耳机);起不来就退回 Web Audio 外放
+      nativePlayback = false;
+      if (bridgeReady) {
+        nativePlayback = native('startPlayback', [audioRate]) === true;
+        logLine(nativePlayback ? '  用原生播放(优先耳机通话链路)' : '  原生播放没起来,退回 Web Audio');
+      }
       // 对话模式:她开始说话了,先闭麦(否则会把她的声音录回来再发给她)
       if (convOn) { gateConv(true); }
       logLine('  开始收语音 ' + audioRate + ' Hz / ' + (frame.channels || 1) + ' 声道');
@@ -656,6 +664,8 @@
       if (typeof row.audio_secs === 'number') { el['s-audio'].textContent = row.audio_secs + ' 秒'; }
       logLine('  语音结束 reason=' + (frame.reason || '?') + ',共 ' + audioSegments + ' 段');
       el['f-audio'].textContent = audioSegments > 0 ? '已播 ' + audioSegments + ' 段' : '空闲';
+      // 没有更多数据了:让原生的缓冲区放完(尾巴不会被切)
+      if (nativePlayback) { native('finishPlayback', []); }
       // 对话模式:等这段(含排队中还没播完的)放完再重新开麦
       if (convOn) { ungateAfterPlayback(); }
     } else if (type === 'error') {
@@ -699,6 +709,19 @@
    * 不攒到最后:nextPlayTime 是游标,每段首尾相接,边收边播。
    */
   function playPcm(buffer) {
+    // 优先交给**原生播放**:它能把声音按"通话音路"送到蓝牙耳机(见 QingyuPlayer 的注释)。
+    // Web Audio 的输出走媒体流,而对话模式为了拿耳机麦克风一直挂着 SCO —— SCO 一挂 A2DP 就停,
+    // 媒体流没有去耳机的路,只能从手机扬声器出来(2026-10-03 用户报的就是这个)。
+    if (nativePlayback) {
+      var b64 = (pure ? pure.bytesToBase64(new Uint8Array(buffer)) : null);
+      if (b64) {
+        native('writePlayback', [b64]);
+        audioSegments += 1;
+        logLine('  播放第 ' + audioSegments + ' 段(原生):' + (buffer.byteLength / 1024).toFixed(1) + ' KB');
+        el['f-audio'].textContent = '原生播放 ' + audioSegments + ' 段';
+        return;
+      }
+    }
     var ctx = unlockAudio();
     if (!ctx) { return; }
     var samples = Math.floor(buffer.byteLength / 2);
@@ -996,7 +1019,11 @@
   function ungateAfterPlayback() {
     if (!convOn) { return; }
     var queuedMs = 0;
-    if (audioContext && nextPlayTime) {
+    if (nativePlayback) {
+      // 原生播放:直接问它"还剩多少毫秒"
+      var left = native('playbackRemainingMs', []);
+      queuedMs = (typeof left === 'number' && left > 0) ? left : 0;
+    } else if (audioContext && nextPlayTime) {
       queuedMs = Math.max(0, (nextPlayTime - audioContext.currentTime) * 1000);
     }
     if (convGateTimer) { clearTimeout(convGateTimer); convGateTimer = null; }

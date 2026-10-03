@@ -39,6 +39,7 @@ import {
   qingyuAudioJava,
   qingyuCameraJava,
   qingyuNativeJava,
+  qingyuPlayerJava,
   qingyuServiceJava,
 } from '../lib/android-sources.js';
 import { ANDROID_DIR, ROOT } from '../lib/toolchain.js';
@@ -73,6 +74,7 @@ written.push(emit('app/src/main/AndroidManifest.xml', manifestXml()));
 written.push(emit('app/src/main/java/' + PACKAGE_PATH + '/MainActivity.java', mainActivityJava()));
 written.push(emit('app/src/main/java/' + PACKAGE_PATH + '/QingyuNative.java', qingyuNativeJava()));
 written.push(emit('app/src/main/java/' + PACKAGE_PATH + '/QingyuAudio.java', qingyuAudioJava()));
+written.push(emit('app/src/main/java/' + PACKAGE_PATH + '/QingyuPlayer.java', qingyuPlayerJava()));
 written.push(emit('app/src/main/java/' + PACKAGE_PATH + '/QingyuCamera.java', qingyuCameraJava()));
 written.push(emit('app/src/main/java/' + PACKAGE_PATH + '/QingyuService.java', qingyuServiceJava()));
 written.push(emit('app/src/main/res/xml/file_paths.xml', filePathsXml()));

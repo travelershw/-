@@ -127,6 +127,8 @@ const wantedClasses = [
   `L${packagePath}/QingyuNative;`,
   // 阶段 2 新增:录音(强制蓝牙耳机麦)与拍照
   `L${packagePath}/QingyuAudio;`,
+  // 播放她的话要用原生 AudioTrack(Web Audio 走媒体流,出不了耳机)
+  `L${packagePath}/QingyuPlayer;`,
   `L${packagePath}/QingyuCamera;`,
   // 后台保活前台服务
   `L${packagePath}/QingyuService;`,
@@ -134,6 +136,8 @@ const wantedClasses = [
   'Landroid/app/Notification$Builder;',
   'Landroid/webkit/WebView;',
   'Landroid/media/AudioRecord;',
+  'Landroid/media/AudioTrack;',
+  'Landroid/media/AudioAttributes;',
   'Landroidx/core/content/FileProvider;',
 ];
 for (const descriptor of wantedClasses) {
@@ -185,6 +189,15 @@ const wantedStrings = [
   ['dev.qingyu.phone.action.STOP', '通知上的停止动作'],
   ['android.permission.POST_NOTIFICATIONS', 'Android 13+ 通知权限常量'],
   ['currentMic', '当前麦克风字段'],
+  // 播放她的话:必须用原生 AudioTrack + 通话用法,否则声音出不了耳机
+  ['startPlayback', '原生播放启动'],
+  ['writePlayback', '原生播放写数据'],
+  ['finishPlayback', '原生播放收尾'],
+  ['playbackRemainingMs', '原生播放剩余时长'],
+  // 注意:AudioAttributes.USAGE_VOICE_COMMUNICATION 是 public static final int,
+  // javac 会把它**内联**掉,dex 里就没有这个字段名了 —— 所以查我们自己那个字符串字面量
+  ['voice_communication', '播放用通话用法(进耳机)'],
+  ['playerRoute', '播放输出设备字段'],
   ['findWiredHeadsetInput', '有线/USB 耳麦优先'],
 ];
 for (const [needle, label] of wantedStrings) {
@@ -223,6 +236,8 @@ if (assetEntry === undefined) {
       ['单句按钮', '说一句'],
       ['调原生开对话模式', 'startConversation'],
       ['对话模式切句参数', 'CONV_SILENCE_MS'],
+      ['原生播放她的话', 'startPlayback'],
+      ['原生播放收尾', 'finishPlayback'],
       ['调原生开始录音', 'startRecording'],
       ['调原生停止录音', 'stopRecording'],
       ['读原生音频路由', 'getAudioRoute'],
