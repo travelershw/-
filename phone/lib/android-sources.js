@@ -1159,14 +1159,14 @@ public class QingyuAudio {
             json.put("btEnabled", bluetoothEnabled());
             json.put("headsetPermission", headsetPermissionState());
             json.put("audioPermission", audioPermissionState());
-            json.put("availableCommunication", availableCommunicationList());
+            json.put("availableCommunication", toJsonArray(availableCommunicationList()));
             // 代理没就绪时这里会是字符串"未就绪…",不是空数组 —— 空数组会被读成"真的没连"
             json.put("connectedHeadsets", connectedHeadsetsValue());
-            json.put("bondedDevices", bondedDeviceNames());
+            json.put("bondedDevices", toJsonArray(bondedDeviceNames()));
             json.put("headsetProfileState", profileStateText(BluetoothProfile.HEADSET));
             json.put("a2dpProfileState", profileStateText(BluetoothProfile.A2DP));
-            json.put("inputDevices", deviceList(AudioManager.GET_DEVICES_INPUTS));
-            json.put("outputDevices", deviceList(AudioManager.GET_DEVICES_OUTPUTS));
+            json.put("inputDevices", toJsonArray(deviceList(AudioManager.GET_DEVICES_INPUTS)));
+            json.put("outputDevices", toJsonArray(deviceList(AudioManager.GET_DEVICES_OUTPUTS)));
             json.put("sdkInt", Build.VERSION.SDK_INT);
             json.put("sampleRate", SAMPLE_RATE);
             json.put("scoMode", scoMode);
@@ -1457,6 +1457,26 @@ public class QingyuAudio {
             sb.append(items.get(i));
         }
         return sb.toString();
+    }
+
+    /**
+     * List&lt;String&gt; → JSON 数组。
+     *
+     * 必须显式转换:直接 json.put(name, list) 时 org.json 会把它写成**字符串**
+     * (Java 的 [A, B, C] 形式),页面按数组用就会抛
+     * "available.filter is not a function" —— 2026-10-03 实测到这句异常把每轮录音都
+     * 静默丢掉了(它排在"把录音排上发送"之前)。只有 JSONArray 才是真数组。
+     * @param items 条目。
+     * @return JSON 数组(永不为 null)。
+     */
+    private JSONArray toJsonArray(List<String> items) {
+        JSONArray array = new JSONArray();
+        if (items != null) {
+            for (String item : items) {
+                array.put(item);
+            }
+        }
+        return array;
     }
 
     /**

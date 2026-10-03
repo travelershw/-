@@ -769,7 +769,8 @@
   function stopTalking(autoReason) {
     if (!recording) { return; }
     // 先取"录音中"的真实路由:一停录音,AudioRecord 就没了,routedDevice 也就读不到了
-    var during = fetchRoute();
+    var during = null;
+    try { during = fetchRoute(); } catch (error) { logLine('读路由出错(不影响发送): ' + error); }
     recording = false;
     native('stopRecording', []);
     if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
@@ -777,19 +778,25 @@
     el.ptt.textContent = '按住说话';
     el.recordText.textContent = '已停(' + (recordedBytes / 1024).toFixed(1) + ' KB)';
     if (autoReason) { logLine('录音被自动停止: ' + autoReason); }
-    if (during) {
-      renderRoute(during);
-      showLastRecording(during);
-      logLine('本次录音输入=' + (during.routedDevice || '无') + '[' + (during.routedDeviceType || '-') + ']'
-        + ' 档位:' + (during.lastAttempt || '-'));
-    }
-    refreshRoute();
-    // 等 150 ms:最后一块(不足 100 ms 的尾巴)的 onChunk 是 post 过来的,先让它落地
+    // **先把发送排上,再去显示路由**:2026-10-03 踩过 —— 显示路由的代码抛了异常,
+    // 于是 setTimeout(sendUtterance) 根本没执行,整段录音被静默丢掉(页面只剩一句
+    // "Script error.")。用户说的话绝不能因为"画界面"失败而消失。
     if (sendTimer) { clearTimeout(sendTimer); }
     sendTimer = setTimeout(function () {
       sendTimer = null;
       sendUtterance();
     }, 150);
+    try {
+      if (during) {
+        renderRoute(during);
+        showLastRecording(during);
+        logLine('本次录音输入=' + (during.routedDevice || '无') + '[' + (during.routedDeviceType || '-') + ']'
+          + ' 档位:' + (during.lastAttempt || '-'));
+      }
+      refreshRoute();
+    } catch (error) {
+      logLine('显示路由出错(录音已排上发送): ' + error);
+    }
   }
 
   function updateRecordText() {

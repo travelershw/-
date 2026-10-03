@@ -100,8 +100,13 @@ Test-Check 'v2 signature scheme present' ($sign.Output -match 'v2 scheme.*: true
 # 3. Manifest facts the app depends on.
 $badging = (Invoke-Tool 'aapt2.exe' @('dump', 'badging', $Apk)).Output
 Test-Check 'package dev.qingyu.phone' ($badging -match "package: name='dev\.qingyu\.phone'")
-Test-Check 'versionName 0.2.0' ($badging -match "versionName='0\.2\.0'") ([regex]::Match($badging, "versionName='[^']*'")).Value
-Test-Check 'versionCode 2' ($badging -match "versionCode='2'")
+# Version expectations come from lib/android-project.js (单一来源), not hardcoded here:
+# a hardcoded pair silently rots the moment the version is bumped (v0.2.1 就撞过一次).
+$projectSource = Get-Content (Join-Path $root 'lib\android-project.js') -Raw
+$expectedName = [regex]::Match($projectSource, "VERSION_NAME = '([^']+)'").Groups[1].Value
+$expectedCode = [regex]::Match($projectSource, 'VERSION_CODE = (\d+)').Groups[1].Value
+Test-Check "versionName $expectedName" ($badging -match "versionName='$([regex]::Escape($expectedName))'") ([regex]::Match($badging, "versionName='[^']*'")).Value
+Test-Check "versionCode $expectedCode" ($badging -match "versionCode='$expectedCode'")
 Test-Check 'minSdk 24' ($badging -match "sdkVersion:'24'") ([regex]::Match($badging, "sdkVersion:'\d+'")).Value
 Test-Check 'targetSdk 35' ($badging -match "targetSdkVersion:'35'") ([regex]::Match($badging, "targetSdkVersion:'\d+'")).Value
 Test-Check 'launcher activity dev.qingyu.phone.MainActivity' ($badging -match "launchable-activity: name='dev\.qingyu\.phone\.MainActivity'")

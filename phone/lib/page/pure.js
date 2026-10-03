@@ -267,9 +267,28 @@
     return '未知';
   }
 
-  /** 列表 → 一行文本,空列表显示 (空)。 */
+  /**
+   * 原生的"列表"字段有两种形态,统一成数组。
+   *
+   * 为什么会有两种:原生用 `JSONObject.put(name, List)` 时,org.json 会把这个 List
+   * 写成**字符串**(Java 的 `[A, B, C]` 形式),只有显式 `JSONArray` 才是真数组。
+   * 2026-10-03 在真机上实测到后果:`available.filter is not a function` 抛 TypeError,
+   * 而它恰好排在"把这段录音排上发送"之前 —— 于是**每句话都被静默丢掉**(页面只留一句
+   * `Script error.`)。所以这里两种都收:数组原样返回,字符串当成"一个整体条目"
+   * (判断"有没有蓝牙"这类用途,只需要整串里能不能匹配到关键字)。
+   * @param {*} value 原生字段值。
+   * @returns {Array} 数组(这个函数永远不抛)。
+   */
+  function asList(value) {
+    if (Array.isArray(value)) { return value; }
+    if (value === null || value === undefined || value === '') { return []; }
+    return [String(value)];
+  }
+
+  /** 列表 → 一行文本,空列表显示 (空)。字符串形态同样收(见 asList)。 */
   function listText(list) {
-    return (list && list.length) ? list.join(' / ') : '(空)';
+    var items = asList(list);
+    return items.length ? items.join(' / ') : '(空)';
   }
 
   /** 耳机路由方式 → 中文。 */
@@ -314,10 +333,10 @@
     var r = route || {};
     if (r.scoOn === true) { return true; }
     if (r.recording && /BLUETOOTH_SCO|BLE_HEADSET/.test(String(r.routedDeviceType || ''))) { return true; }
-    if ((r.availableCommunication || []).some(function (entry) { return /bluetooth|ble_/i.test(String(entry)); })) {
+    if (asList(r.availableCommunication).some(function (entry) { return /bluetooth|ble_/i.test(String(entry)); })) {
       return true;
     }
-    return (r.inputDevices || []).some(function (entry) { return /TYPE_BLUETOOTH_SCO|TYPE_BLE_HEADSET/.test(String(entry)); });
+    return asList(r.inputDevices).some(function (entry) { return /TYPE_BLUETOOTH_SCO|TYPE_BLE_HEADSET/.test(String(entry)); });
   }
 
   /**
@@ -415,12 +434,12 @@
     var r = route || {};
     var sdkInt = typeof r.sdkInt === 'number' ? r.sdkInt : 0;
     var modern = sdkInt >= 31;
-    var available = r.availableCommunication || [];
+    var available = asList(r.availableCommunication);
     // connectedHeadsets 在蓝牙代理就绪前是字符串("未就绪…"),不是数组 —— 不能当成"没连"
     var connected = Array.isArray(r.connectedHeadsets) ? r.connectedHeadsets : [];
     var connectedReady = Array.isArray(r.connectedHeadsets);
     var connectedText = connectedReady ? listText(connected) : String(r.connectedHeadsets || '(空)');
-    var bonded = r.bondedDevices || [];
+    var bonded = asList(r.bondedDevices);
     // 注意:Android 12+ 的可用通信设备里本来就有听筒/扬声器这些非蓝牙项,所以不能只看
     // 列表非空,必须找蓝牙类的那几条(原生给的条目带 "[TYPE_BLUETOOTH_SCO(7,蓝牙SCO)]")。
     var bluetoothEntries = available.filter(function (entry) { return /bluetooth|ble_/i.test(String(entry)); });

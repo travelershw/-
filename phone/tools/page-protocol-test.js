@@ -10,6 +10,7 @@
  *
  * @module qingyu-phone/tools/page-protocol-test
  */
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -414,6 +415,77 @@ check('诊断清单包含全部关键行',
     .every((label) => row(okView, label) !== undefined),
   `${okView.rows.length} 行`);
 check('空路由不炸', pure.summarizeRoute({}).rows.length > 0);
+
+// --- 8. 真机形态的路由 JSON(2026-10-03 的回归) ---------------------------------------
+// v0.2.0 在真机上「按住说话没反应」:原生用 `json.put(name, List)` 时 org.json 把列表写成了
+// **字符串**(Java 的 `[A, B, C]`),页面按数组用 → `available.filter is not a function`
+// 抛异常;而那句渲染恰好排在「把录音排上发送」之前 → 每句话都被静默丢掉。
+// 下面这份夹具就是真机抓到的原样字段(列表是字符串),必须不炸且判断仍然正确。
+console.log('');
+console.log('真机形态的路由 JSON(列表字段是 Java 的字符串形态)');
+
+const wireStrings = {
+  recording: true,
+  mode: 'MODE_IN_COMMUNICATION',
+  scoOn: true,
+  communicationDevice: 'V2046A [TYPE_BLUETOOTH_SCO(7,蓝牙SCO)]',
+  routedDevice: 'V2046A [TYPE_BLUETOOTH_SCO(7,蓝牙SCO)]',
+  routedDeviceType: 'TYPE_BLUETOOTH_SCO(7,蓝牙SCO)',
+  preferredDevice: '',
+  btEnabled: true,
+  headsetPermission: 'granted',
+  audioPermission: 'granted',
+  availableCommunication: '[V2046A [TYPE_BUILTIN_EARPIECE(1,听筒)], V2046A [TYPE_BUILTIN_SPEAKER(2,扬声器)], V2046A [TYPE_BLUETOOTH_SCO(7,蓝牙SCO)]]',
+  connectedHeadsets: ['WH-CH520'],
+  bondedDevices: '[WH-CH520, HUAWEI FreeBuds Pro]',
+  inputDevices: '[V2046A [TYPE_BUILTIN_MIC(15,内置麦克风), 信号源], V2046A [TYPE_BLUETOOTH_SCO(7,蓝牙SCO), 信号源]]',
+  outputDevices: '[WH-CH520 [TYPE_BLUETOOTH_A2DP(8,蓝牙A2DP), 非信号源]]',
+  headsetProfileState: 'STATE_CONNECTED(2)',
+  a2dpProfileState: 'STATE_CONNECTED(2)',
+  sdkInt: 33,
+  sampleRate: 16000,
+  scoMode: 'auto',
+  allowPreferredDevice: false,
+  lastAttempt: '档2 老接口 startBluetoothSco:600 ms 后 type=TYPE_BLUETOOTH_SCO(7,蓝牙SCO), scoOn=true → 成功',
+  lastProbe: '',
+  currentMic: 'V2046A[蓝牙耳机]',
+  currentMicKind: 'bluetooth',
+  diagnostics: '轻语诊断\n应用 0.2.0',
+  hint: '',
+};
+
+let wireView = null;
+let wireError = '';
+try {
+  wireView = pure.summarizeRoute(wireStrings);
+} catch (error) {
+  wireError = String(error);
+}
+check('字符串形态不抛异常(就是这条丢了录音)', wireView !== null, wireError || '无异常');
+check('字符串形态仍能判断"有蓝牙"', pure.bluetoothInputAvailable(wireStrings));
+check('字符串形态的输入设备仍会显示出来',
+  wireView !== null && (row(wireView, '全部输入设备') || {}).value !== '(空)',
+  wireView ? (row(wireView, '全部输入设备') || {}).value : '(没渲染)');
+
+const wireArrays = {
+  ...wireStrings,
+  availableCommunication: ['V2046A [TYPE_BLUETOOTH_SCO(7,蓝牙SCO)]'],
+  bondedDevices: ['WH-CH520'],
+  inputDevices: ['V2046A [TYPE_BLUETOOTH_SCO(7,蓝牙SCO), 信号源]'],
+  outputDevices: ['WH-CH520 [TYPE_BLUETOOTH_A2DP(8,蓝牙A2DP)]'],
+};
+check('数组形态同样不抛', pure.summarizeRoute(wireArrays).rows.length > 0);
+check('数组形态也判断"有蓝牙"', pure.bluetoothInputAvailable(wireArrays));
+
+// 页面调用的每个 pure.X 都必须真的存在 —— 少一个就是"点下去没反应"级别的故障
+// (排除 `pure.js`:页面里有一句日志文字 "pure.js 没加载",它不是成员引用)
+const pageSource = readFileSync(`${ROOT}lib/page/index.html`, 'utf8');
+const referenced = [...new Set([...pageSource.matchAll(/\bpure\.([A-Za-z_$][\w$]*)/g)]
+  .map((match) => match[1])
+  .filter((name) => name !== 'js'))];
+const missing = referenced.filter((name) => pure[name] === undefined);
+check('页面引用的 pure 成员全都存在', missing.length === 0,
+  missing.length ? `缺: ${missing.join(', ')}` : `${referenced.length} 个成员`);
 
 console.log('');
 if (failures.length > 0) {
